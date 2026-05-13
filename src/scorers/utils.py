@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from semantic_desider.features import PairFeatures
-from semantic_desider.thresholds import ThresholdCalibrationRequest
-from semantic_desider.types import Score, Threshold, TieMode
+from features import PairFeatures
+from thresholds import ThresholdCalibrationRequest
+from semantic_types import Score, Threshold, TieMode
 
 
 def np_module():
@@ -73,7 +73,7 @@ def scores_to_threshold(request: ThresholdCalibrationRequest) -> Threshold:
 
 
 def score_rows_with_scorer(rows, scorer):
-    from semantic_desider.features import PairFeatures
+    from features import PairFeatures
 
     np = np_module()
     out = []

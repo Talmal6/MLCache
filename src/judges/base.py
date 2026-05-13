@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Iterable
 
-from semantic_desider.judges.types import JudgeRequest, JudgeResult
+from judges.types import JudgeRequest, JudgeResult
 
 
 class SemanticReuseJudge(ABC):

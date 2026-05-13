@@ -6,8 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from semantic_desider.oracle import SemanticCacheOracle
-from semantic_desider.types import CacheEntry, CacheKey, CacheLookup, OracleDecision, Response
+from oracle import SemanticCacheOracle
+from semantic_types import CacheEntry, CacheKey, CacheLookup, OracleDecision, Response
 
 
 @dataclass(frozen=True, slots=True)

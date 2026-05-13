@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import isfinite
 
-from semantic_desider.online_properties.types import OnlineMetrics, StopStatus
+from online_properties.types import OnlineMetrics, StopStatus
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from semantic_desider.features import PairFeatures
-from semantic_desider.scorers.base import BaseScorer, SemanticScorer
-from semantic_desider.scorers.cosine import CosineScorer
-from semantic_desider.scorers.lda import LDAScorer
-from semantic_desider.scorers.pca_whitened_cosine import PCAWhitenedCosineScorer
-from semantic_desider.scorers.tiny_mlp import TinyMLPScorer
-from semantic_desider.scorers.utils import as_matrix, np_module, scores_to_threshold
-from semantic_desider.thresholds import ThresholdCalibrationRequest
-from semantic_desider.types import InputSpace, LabeledPairBatch, ScorerName, Score
+from features import PairFeatures
+from scorers.base import BaseScorer, SemanticScorer
+from scorers.cosine import CosineScorer
+from scorers.lda import LDAScorer
+from scorers.pca_whitened_cosine import PCAWhitenedCosineScorer
+from scorers.tiny_mlp import TinyMLPScorer
+from scorers.utils import as_matrix, np_module, scores_to_threshold
+from thresholds import ThresholdCalibrationRequest
+from semantic_types import InputSpace, LabeledPairBatch, ScorerName, Score
 
 
 class EnsembleScorer(BaseScorer):
@@ -35,6 +35,9 @@ class EnsembleScorer(BaseScorer):
     def members(self) -> Iterable[SemanticScorer]:
         return tuple(self._judges)
 
+    def copy_for_refit(self):
+        return type(self)(judges=[judge.copy_for_refit() for judge in self._judges])
+
     def fit(self, batch: LabeledPairBatch, **kwargs: object) -> None:
         h0 = as_matrix(batch.h0, name="h0")
         h1 = as_matrix(batch.h1, name="h1")
@@ -46,7 +49,7 @@ class EnsembleScorer(BaseScorer):
         self._weights = self._fit_np_weights(z0, z1, alpha=float(kwargs.get("alpha", 0.05)))
 
     def _score_matrix(self, x):
-        from semantic_desider.features import PairFeatures
+        from features import PairFeatures
 
         np = np_module()
         rows = []

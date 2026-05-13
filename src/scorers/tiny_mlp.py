@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from semantic_desider.features import PairFeatures
-from semantic_desider.scorers.base import BaseScorer
-from semantic_desider.scorers.utils import as_matrix, feature_vector, labels, np_module
-from semantic_desider.types import LabeledPairBatch, ScorerName, Score
+from features import PairFeatures
+from scorers.base import BaseScorer
+from scorers.utils import as_matrix, feature_vector, labels, np_module
+from semantic_types import LabeledPairBatch, ScorerName, Score
 
 
 class TinyMLPScorer(BaseScorer):
@@ -15,6 +15,9 @@ class TinyMLPScorer(BaseScorer):
         self.hidden_layer_sizes = hidden_layer_sizes
         self.max_iter = int(max_iter)
         self._clf = None
+
+    def copy_for_refit(self):
+        return type(self)(hidden_layer_sizes=self.hidden_layer_sizes, max_iter=self.max_iter)
 
     def fit(self, batch: LabeledPairBatch, **kwargs: object) -> None:
         np = np_module()

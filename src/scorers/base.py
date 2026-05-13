@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from semantic_desider.features import PairFeatures
-from semantic_desider.thresholds import ThresholdCalibrationRequest
-from semantic_desider.types import InputSpace, LabeledPairBatch, ScorerName, Score, Threshold, TieMode
+from features import PairFeatures
+from thresholds import ThresholdCalibrationRequest
+from semantic_types import InputSpace, LabeledPairBatch, ScorerName, Score, Threshold, TieMode
 
 
 class SemanticScorer(ABC):
@@ -24,6 +24,10 @@ class SemanticScorer(ABC):
 
     @abstractmethod
     def fit(self, batch: LabeledPairBatch, **kwargs: object) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def copy_for_refit(self) -> "SemanticScorer":
         raise NotImplementedError
 
     @abstractmethod
@@ -59,8 +63,11 @@ class BaseScorer(SemanticScorer):
     def input_space(self) -> InputSpace:
         return self._input_space
 
+    def copy_for_refit(self) -> SemanticScorer:
+        return type(self)()
+
     def calibrate(self, request: ThresholdCalibrationRequest) -> Threshold:
-        from semantic_desider.scorers.utils import scores_to_threshold
+        from scorers.utils import scores_to_threshold
 
         return scores_to_threshold(request)
 

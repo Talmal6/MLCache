@@ -1,9 +1,9 @@
 """Interface-only contracts for an external semantic cache."""
 
-from semantic_desider.audit import AuditEvent, AuditLogger
-from semantic_desider.cache import CacheGatewayResult, ExternalSemanticCache, KVStore, SemanticCacheGateway
-from semantic_desider.features import PairFeatureBuilder, PairFeatureKind, PairFeatures
-from semantic_desider.judges import (
+from audit import AuditEvent, AuditLogger
+from cache import CacheGatewayResult, ExternalSemanticCache, KVStore, SemanticCacheGateway
+from features import PairFeatureBuilder, PairFeatureKind, PairFeatures
+from judges import (
     FIFOTrainingExampleEvictionPolicy,
     InMemoryJudgeTrainingStore,
     JudgeDecision,
@@ -15,7 +15,7 @@ from semantic_desider.judges import (
     SemanticReuseJudge,
     TrainingExampleEvictionPolicy,
 )
-from semantic_desider.online_properties import (
+from online_properties import (
     FeedbackEvent,
     OnlineBatch,
     OnlineMetrics,
@@ -25,9 +25,17 @@ from semantic_desider.online_properties import (
     StopStatus,
     WindowedOnlineStoppingController,
 )
-from semantic_desider.oracle import OracleFitResult, SemanticCacheOracle, TrainableSemanticCacheOracle
-from semantic_desider.policy import CachePolicy, PolicyAction, PolicyContext, PolicyDecision
-from semantic_desider.scorers import (
+from oracle import OracleFitResult, OracleRuntimeSnapshot, SemanticCacheOracle, TrainableSemanticCacheOracle
+from policy import CachePolicy, PolicyAction, PolicyContext, PolicyDecision
+from refit_policy import (
+    ConservativeRefitConfig,
+    ConservativeRefitPolicy,
+    RefitAction,
+    RefitPolicy,
+    RefitPolicyContext,
+    RefitPolicyDecision,
+)
+from scorers import (
     CosineScorer,
     EnsembleScorer,
     LDAScorer,
@@ -37,14 +45,14 @@ from semantic_desider.scorers import (
     TinyMLPScorer,
     XGBoostScorer,
 )
-from semantic_desider.thresholds import (
+from thresholds import (
     CalibrationExample,
     NPThresholdCalibrator,
     ThresholdCalibrationRequest,
     ThresholdProvider,
     ThresholdScope,
 )
-from semantic_desider.types import (
+from semantic_types import (
     CacheEntry,
     CacheKey,
     CacheLookup,
@@ -63,7 +71,7 @@ from semantic_desider.types import (
     TieMode,
     TrainCalibEvalSplit,
 )
-from semantic_desider.vector_store import VectorSearchResult, VectorStore
+from vector_store import VectorSearchResult, VectorStore
 
 __all__ = [
     "AuditEvent",
@@ -76,6 +84,8 @@ __all__ = [
     "CacheMetadata",
     "CachePolicy",
     "CosineScorer",
+    "ConservativeRefitConfig",
+    "ConservativeRefitPolicy",
     "Embedding",
     "EnsembleScorer",
     "ExternalSemanticCache",
@@ -101,6 +111,7 @@ __all__ = [
     "OracleDecision",
     "OracleDecisionStatus",
     "OracleFitResult",
+    "OracleRuntimeSnapshot",
     "PCAWhitenedCosineScorer",
     "PairFeatureBuilder",
     "PairFeatureKind",
@@ -110,6 +121,10 @@ __all__ = [
     "PolicyDecision",
     "Query",
     "RegionId",
+    "RefitAction",
+    "RefitPolicy",
+    "RefitPolicyContext",
+    "RefitPolicyDecision",
     "Response",
     "Score",
     "ScorerName",

@@ -1,12 +1,12 @@
 """Online update and stopping properties."""
 
-from semantic_desider.online_properties.stopping import (
+from online_properties.stopping import (
     OnlineStoppingConfig,
     OnlineStoppingController,
     WindowedOnlineStoppingController,
 )
-from semantic_desider.online_properties.types import FeedbackEvent, OnlineBatch, OnlineMetrics, StopStatus
-from semantic_desider.online_properties.updater import OnlineUpdater
+from online_properties.types import FeedbackEvent, OnlineBatch, OnlineMetrics, StopStatus
+from online_properties.updater import OnlineUpdater
 
 __all__ = [
     "FeedbackEvent",

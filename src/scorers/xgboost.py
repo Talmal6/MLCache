@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from semantic_desider.features import PairFeatures
-from semantic_desider.scorers.base import BaseScorer
-from semantic_desider.scorers.utils import as_matrix, feature_vector, labels, np_module
-from semantic_desider.types import LabeledPairBatch, ScorerName, Score
+from features import PairFeatures
+from scorers.base import BaseScorer
+from scorers.utils import as_matrix, feature_vector, labels, np_module
+from semantic_types import LabeledPairBatch, ScorerName, Score
 
 
 class XGBoostScorer(BaseScorer):
@@ -14,6 +14,9 @@ class XGBoostScorer(BaseScorer):
     def __init__(self, **model_kwargs: object) -> None:
         self._model_kwargs = dict(model_kwargs)
         self._clf = None
+
+    def copy_for_refit(self):
+        return type(self)(**self._model_kwargs)
 
     def fit(self, batch: LabeledPairBatch, **kwargs: object) -> None:
         np = np_module()

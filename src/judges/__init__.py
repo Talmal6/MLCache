@@ -1,14 +1,14 @@
 """Semantic reuse judge interfaces."""
 
-from semantic_desider.judges.base import SemanticReuseJudge
-from semantic_desider.judges.store import (
+from judges.base import SemanticReuseJudge
+from judges.store import (
     FIFOTrainingExampleEvictionPolicy,
     InMemoryJudgeTrainingStore,
     JudgedPairExample,
     JudgeTrainingStore,
     TrainingExampleEvictionPolicy,
 )
-from semantic_desider.judges.types import (
+from judges.types import (
     JudgeDecision,
     JudgeLabel,
     JudgeRequest,

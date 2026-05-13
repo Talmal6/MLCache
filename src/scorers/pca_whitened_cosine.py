@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from semantic_desider.features import PairFeatures
-from semantic_desider.scorers.base import BaseScorer
-from semantic_desider.scorers.utils import as_matrix, feature_vector, np_module
-from semantic_desider.types import LabeledPairBatch, ScorerName, Score
+from features import PairFeatures
+from scorers.base import BaseScorer
+from scorers.utils import as_matrix, feature_vector, np_module
+from semantic_types import LabeledPairBatch, ScorerName, Score
 
 
 class PCAWhitenedCosineScorer(BaseScorer):
@@ -19,6 +19,9 @@ class PCAWhitenedCosineScorer(BaseScorer):
         self._mean = None
         self._transform = None
         self._prototype = None
+
+    def copy_for_refit(self):
+        return type(self)(n_components=self.n_components, eps=self.eps)
 
     def fit(self, batch: LabeledPairBatch, **kwargs: object) -> None:
         np = np_module()

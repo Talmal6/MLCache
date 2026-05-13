@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Iterable
 
-from semantic_desider.types import RegionId, ScorerName, Score, Threshold, TieMode
+from semantic_types import RegionId, ScorerName, Score, Threshold, TieMode
 
 
 class ThresholdScope(StrEnum):

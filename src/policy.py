@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from semantic_desider.thresholds import ThresholdScope
-from semantic_desider.types import CacheEntry, CacheLookup, ScorerName, TieMode
-from semantic_desider.vector_store import VectorSearchResult
+from thresholds import ThresholdScope
+from semantic_types import CacheEntry, CacheLookup, ScorerName, TieMode
+from vector_store import VectorSearchResult
 
 
 class PolicyAction(StrEnum):

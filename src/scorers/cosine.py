@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from semantic_desider.features import PairFeatures
-from semantic_desider.scorers.base import BaseScorer
-from semantic_desider.scorers.utils import feature_vector, np_module
-from semantic_desider.types import LabeledPairBatch, ScorerName, Score
+from features import PairFeatures
+from scorers.base import BaseScorer
+from scorers.utils import feature_vector, np_module
+from semantic_types import LabeledPairBatch, ScorerName, Score
 
 
 class CosineScorer(BaseScorer):

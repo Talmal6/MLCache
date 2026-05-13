@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from semantic_desider.types import CacheKey, OracleDecision, Query
+from semantic_types import CacheKey, OracleDecision, Query
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-from semantic_desider.types import CacheEntry, CacheKey, CacheMetadata, Embedding, Query, Score
+from semantic_types import CacheEntry, CacheKey, CacheMetadata, Embedding, Query, Score
 
 
 @dataclass(frozen=True, slots=True)

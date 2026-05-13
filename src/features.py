@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from semantic_desider.types import Embedding, Score
+from semantic_types import Embedding, Score
 
 
 class PairFeatureKind(StrEnum):

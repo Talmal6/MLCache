@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from semantic_desider.types import CacheKey, CacheMetadata, Query, Response, Score
+from semantic_types import CacheKey, CacheMetadata, Query, Response, Score
 
 
 class JudgeLabel(StrEnum):

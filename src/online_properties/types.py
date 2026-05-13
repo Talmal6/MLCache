@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from semantic_desider.types import OracleDecision, Query, Response, Threshold
+from semantic_types import OracleDecision, Query, Response, Threshold
 
 
 @dataclass(frozen=True, slots=True)

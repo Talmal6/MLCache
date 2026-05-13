@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
-from semantic_desider.judges.types import JudgeDecision, JudgeLabel, JudgeRequest
+from judges.types import JudgeDecision, JudgeLabel, JudgeRequest
 
 
 @dataclass(frozen=True, slots=True)
