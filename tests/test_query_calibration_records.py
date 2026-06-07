@@ -10,6 +10,7 @@ from mlcache.calibration import (
     InMemoryQueryCalibrationRecordStore,
     QueryCalibrationRecordBuilder,
     QueryCalibrationRecordStore,
+    QueryLevelCalibrationConfig,
     ThresholdCalibrationRequest,
 )
 from mlcache.features import NormalizedHadamardFeatureBuilder
@@ -328,6 +329,24 @@ class QueryCalibrationRecordTests(unittest.TestCase):
 
         self.assertEqual(record_store.records(), ())
 
+    def test_shadow_collector_requires_builder_and_store_when_query_recording_enabled(self) -> None:
+        with self.assertRaisesRegex(ValueError, "query_record_builder and query_record_store"):
+            DefaultShadowTopKCollector(
+                feature_builder=NormalizedHadamardFeatureBuilder(),
+                judge=DeterministicJudge({}),
+                store=split_store(),
+                record_query_calibration=True,
+            )
+
+        with self.assertRaisesRegex(ValueError, "query_record_builder and query_record_store"):
+            DefaultShadowTopKCollector(
+                feature_builder=NormalizedHadamardFeatureBuilder(),
+                judge=DeterministicJudge({}),
+                store=split_store(),
+                query_record_builder=QueryCalibrationRecordBuilder(),
+                record_query_calibration=True,
+            )
+
     def test_shadow_collector_stores_one_query_record_when_enabled(self) -> None:
         record_store = InMemoryQueryCalibrationRecordStore(max_records=10)
         collector = DefaultShadowTopKCollector(
@@ -437,12 +456,19 @@ class QueryCalibrationRecordTests(unittest.TestCase):
             ],
             served_decision(),
         )
-        dataset = DefaultQueryLevelCalibrationBuilder().build_calibration_decisions(record_store.records())
+        builder = DefaultQueryLevelCalibrationBuilder(
+            config=QueryLevelCalibrationConfig(min_selected_h0=1, fpr_wilson_margin=0.8)
+        )
+        dataset = builder.build_calibration_decisions(record_store.records())
+        result = builder.calibrate(dataset)
 
         self.assertEqual(len(dataset.decisions), 1)
         self.assertEqual(dataset.decisions[0].candidate_key, CacheKey("h0-selected"))
         self.assertEqual(tuple(float(score) for score in dataset.h0_scores), (0.9,))
         self.assertEqual(tuple(float(score) for score in dataset.all_pair_h0_scores), (0.9, 0.7))
+        self.assertIsNotNone(result.threshold)
+        self.assertTrue(result.metadata["calibration_gate_passed"])
+        self.assertEqual(tuple(float(score) for score in result.dataset.h0_scores), (0.9,))
 
 
 if __name__ == "__main__":

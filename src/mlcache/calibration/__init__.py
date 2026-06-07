@@ -10,6 +10,7 @@ from mlcache.calibration.query_level import (
     QueryCalibrationDecision,
     QueryCalibrationRecord,
     QueryLevelCalibrationResult,
+    QueryLevelCalibrationConfig,
     QueryLevelCalibrator,
 )
 from mlcache.calibration.types import CalibrationExample, ThresholdCalibrationRequest, ThresholdScope
@@ -25,6 +26,7 @@ __all__ = [
     "QueryCalibrationRecord",
     "QueryCalibrationRecordBuilder",
     "QueryCalibrationRecordStore",
+    "QueryLevelCalibrationConfig",
     "QueryLevelCalibrationResult",
     "QueryLevelCalibrator",
     "InMemoryQueryCalibrationRecordStore",

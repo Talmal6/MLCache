@@ -3,7 +3,9 @@ import unittest
 from mlcache.calibration import (
     DefaultQueryLevelCalibrationBuilder,
     QueryCalibrationCandidate,
+    QueryCalibrationDataset,
     QueryCalibrationRecord,
+    QueryLevelCalibrationConfig,
     ThresholdCalibrationRequest,
 )
 from mlcache.features import NormalizedHadamardFeatureBuilder
@@ -47,6 +49,14 @@ def candidate(
 
 def record(query_id: str, candidates: list[QueryCalibrationCandidate], metadata: dict | None = None):
     return QueryCalibrationRecord(query_id=query_id, candidates=candidates, metadata=metadata or {})
+
+
+def calibration_dataset(selected_h0_scores, all_pair_h0_scores=None) -> QueryCalibrationDataset:
+    return QueryCalibrationDataset(
+        decisions=(),
+        h0_scores=tuple(Score(float(score)) for score in selected_h0_scores),
+        all_pair_h0_scores=tuple(Score(float(score)) for score in (all_pair_h0_scores or selected_h0_scores)),
+    )
 
 
 class StaticVectorStore(VectorStore):
@@ -208,6 +218,109 @@ class QueryLevelCalibrationTests(unittest.TestCase):
         self.assertEqual(after.status, before.status)
         self.assertEqual(after.cache_key, before.cache_key)
         self.assertEqual(after.threshold, before.threshold)
+
+    def test_calibrate_uses_selected_h0_scores_not_all_pair_h0_scores(self) -> None:
+        dataset = calibration_dataset(
+            selected_h0_scores=[0.1] * 500,
+            all_pair_h0_scores=([0.1] * 500) + ([0.99] * 500),
+        )
+
+        result = DefaultQueryLevelCalibrationBuilder().calibrate(dataset)
+
+        self.assertIsNotNone(result.threshold)
+        self.assertLess(float(result.threshold), 0.99)
+        self.assertEqual(result.metadata["selected_h0_accepts"], 0)
+        self.assertEqual(result.metadata["all_pair_h0_accepts_at_threshold"], 500)
+        self.assertEqual(result.metadata["selected_vs_all_pair_note"], "threshold_calibrated_on_selected_h0_scores_only")
+
+    def test_calibration_fails_when_selected_h0_count_below_minimum(self) -> None:
+        builder = DefaultQueryLevelCalibrationBuilder(
+            config=QueryLevelCalibrationConfig(min_selected_h0=11)
+        )
+
+        result = builder.calibrate(calibration_dataset([0.1] * 10))
+
+        self.assertIsNone(result.threshold)
+        self.assertFalse(result.metadata["calibration_gate_passed"])
+        self.assertEqual(result.metadata["calibration_gate_reason"], "min_selected_h0_not_met")
+
+    def test_calibration_passes_with_enough_selected_h0_and_wilson_bound(self) -> None:
+        dataset = calibration_dataset(([0.9] * 25) + ([0.1] * 475))
+
+        result = DefaultQueryLevelCalibrationBuilder().calibrate(dataset)
+
+        self.assertEqual(result.threshold, Threshold(0.9))
+        self.assertTrue(result.metadata["calibration_gate_passed"])
+        self.assertIsNone(result.metadata["calibration_gate_reason"])
+        self.assertEqual(result.metadata["selected_h0_count"], 500)
+        self.assertEqual(result.metadata["selected_h0_accepts"], 25)
+        self.assertAlmostEqual(result.metadata["empirical_selected_fpr"], 0.05)
+        self.assertAlmostEqual(result.metadata["wilson_upper_selected_fpr"], 0.07277, places=5)
+        self.assertAlmostEqual(result.metadata["allowed_fpr_bound"], 0.08)
+        self.assertTrue(result.metadata["threshold_is_finite"])
+
+    def test_calibration_fails_when_wilson_upper_exceeds_alpha_plus_margin(self) -> None:
+        builder = DefaultQueryLevelCalibrationBuilder(
+            config=QueryLevelCalibrationConfig(fpr_wilson_margin=0.0)
+        )
+        dataset = calibration_dataset(([0.9] * 25) + ([0.1] * 475))
+
+        result = builder.calibrate(dataset)
+
+        self.assertIsNone(result.threshold)
+        self.assertFalse(result.metadata["calibration_gate_passed"])
+        self.assertEqual(result.metadata["calibration_gate_reason"], "wilson_upper_selected_fpr_exceeds_bound")
+        self.assertGreater(result.metadata["wilson_upper_selected_fpr"], result.metadata["allowed_fpr_bound"])
+
+    def test_all_pair_h0_scores_are_diagnostics_only(self) -> None:
+        selected = ([0.9] * 25) + ([0.1] * 475)
+        builder = DefaultQueryLevelCalibrationBuilder()
+
+        with_low_all_pair = builder.calibrate(calibration_dataset(selected, all_pair_h0_scores=selected))
+        with_high_all_pair = builder.calibrate(
+            calibration_dataset(selected, all_pair_h0_scores=selected + ([0.99] * 50))
+        )
+
+        self.assertEqual(with_low_all_pair.threshold, with_high_all_pair.threshold)
+        self.assertEqual(with_low_all_pair.metadata["selected_h0_count"], 500)
+        self.assertEqual(with_high_all_pair.metadata["selected_h0_count"], 500)
+        self.assertEqual(with_low_all_pair.metadata["all_pair_h0_count"], 500)
+        self.assertEqual(with_high_all_pair.metadata["all_pair_h0_count"], 550)
+
+    def test_ge_and_gt_tie_modes_are_deterministic(self) -> None:
+        dataset = calibration_dataset([0.9, 0.8, 0.1, 0.0])
+        ge_builder = DefaultQueryLevelCalibrationBuilder(
+            config=QueryLevelCalibrationConfig(
+                target_false_accept_rate=0.25,
+                min_selected_h0=4,
+                fpr_wilson_margin=0.8,
+                tie_mode=TieMode.GE,
+            )
+        )
+        gt_builder = DefaultQueryLevelCalibrationBuilder(
+            config=QueryLevelCalibrationConfig(
+                target_false_accept_rate=0.25,
+                min_selected_h0=4,
+                fpr_wilson_margin=0.8,
+                tie_mode=TieMode.GT,
+            )
+        )
+
+        ge = ge_builder.calibrate(dataset)
+        gt = gt_builder.calibrate(dataset)
+
+        self.assertEqual(ge.threshold, Threshold(0.9))
+        self.assertLess(float(gt.threshold), 0.9)
+        self.assertEqual(gt.metadata["tie_mode"], "gt")
+        self.assertEqual(ge.metadata["selected_h0_accepts"], 1)
+        self.assertEqual(gt.metadata["selected_h0_accepts"], 1)
+
+    def test_query_level_calibration_result_preserves_dataset(self) -> None:
+        dataset = calibration_dataset(([0.9] * 25) + ([0.1] * 475))
+
+        result = DefaultQueryLevelCalibrationBuilder().calibrate(dataset)
+
+        self.assertIs(result.dataset, dataset)
 
 
 if __name__ == "__main__":

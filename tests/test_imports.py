@@ -3,10 +3,11 @@ from features import NormalizedHadamardFeatureBuilder, PairFeatureBuilder
 from judges import DefaultShadowTopKCollector as OldDefaultShadowTopKCollector
 from judges.store import InMemorySplitJudgeTrainingStore, SplitJudgeTrainingStore
 from oracle import ActivationGateResult, TrainableSemanticCacheOracle
-from thresholds import ThresholdCalibrationRequest
+from thresholds import QueryLevelCalibrationConfig, ThresholdCalibrationRequest
 from vector_store import VectorStore
 
 from mlcache.cache import SemanticCacheGateway as NewSemanticCacheGateway
+from mlcache.calibration import QueryLevelCalibrationConfig as NewQueryLevelCalibrationConfig
 from mlcache.calibration import ThresholdCalibrationRequest as NewThresholdCalibrationRequest
 from mlcache.calibration import wilson_upper_bound
 from mlcache.feedback import DefaultShadowTopKCollector, InMemorySplitJudgeTrainingStore as NewSplitStore
@@ -26,6 +27,7 @@ class ImportTests(unittest.TestCase):
         self.assertIs(TrainableSemanticCacheOracle, NewTrainableSemanticCacheOracle)
         self.assertIs(NormalizedHadamardFeatureBuilder, NewNormalizedHadamardFeatureBuilder)
         self.assertIs(ThresholdCalibrationRequest, NewThresholdCalibrationRequest)
+        self.assertIs(QueryLevelCalibrationConfig, NewQueryLevelCalibrationConfig)
         self.assertIs(VectorStore, NewVectorStore)
         self.assertIs(InMemorySplitJudgeTrainingStore, NewSplitStore)
         self.assertIs(SplitJudgeTrainingStore, NewSplitJudgeTrainingStore)
@@ -38,6 +40,7 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(NewTrainableSemanticCacheOracle.__name__, "TrainableSemanticCacheOracle")
         self.assertEqual(NewNormalizedHadamardFeatureBuilder.__name__, "NormalizedHadamardFeatureBuilder")
         self.assertEqual(NewThresholdCalibrationRequest.__name__, "ThresholdCalibrationRequest")
+        self.assertEqual(NewQueryLevelCalibrationConfig.__name__, "QueryLevelCalibrationConfig")
         self.assertEqual(NewVectorStore.__name__, "VectorStore")
         self.assertEqual(DefaultShadowTopKCollector.__name__, "DefaultShadowTopKCollector")
         self.assertEqual(NewSplitStore.__name__, "InMemorySplitJudgeTrainingStore")

@@ -92,6 +92,12 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         self.query_record_builder = query_record_builder
         self.query_record_store = query_record_store
         self.record_query_calibration = bool(record_query_calibration)
+        if self.record_query_calibration and (
+            self.query_record_builder is None or self.query_record_store is None
+        ):
+            raise ValueError(
+                "record_query_calibration=True requires both query_record_builder and query_record_store"
+            )
         self._validate_config()
         self._lock = RLock()
         self._pairs_observed = 0
