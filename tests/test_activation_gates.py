@@ -402,6 +402,14 @@ class ActivationGateTests(unittest.TestCase):
         passed_refit.fit(valid_split())
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(provider.calls[-1][0], Threshold(0.5))
+        passed_context = provider.calls[-1][3]
+        self.assertIsNotNone(passed_context)
+        self.assertTrue(passed_context["activation_gate_passed"])
+        self.assertIsNone(passed_context["activation_gate_reason"])
+        self.assertEqual(passed_context["candidate_threshold"], Threshold(0.5))
+        self.assertEqual(passed_context["active_threshold"], Threshold(0.5))
+        self.assertEqual(passed_context["calibration_h0_accepts"], 25)
+        self.assertIn("wilson_upper_fpr", passed_context)
 
         failed_recalibration = oracle(threshold=Threshold(0.4), threshold_provider=provider)
         failed_recalibration._recalibrate_threshold_from_rows(rows(499, 0.0), metadata={})
@@ -420,16 +428,22 @@ class ActivationGateTests(unittest.TestCase):
         self.assertEqual(provider.calls[-1][0], Threshold(0.6))
 
     def test_failed_refit_does_not_replace_existing_scorer_or_threshold(self) -> None:
-        active_scorer = GateScorer(threshold=0.4, name="active")
+        active_scorer = GateScorer(threshold=0.9, name="active")
         cache_oracle = oracle(scorer=active_scorer, threshold=Threshold(0.4))
         cache_oracle._threshold_version = 3
 
-        cache_oracle.fit(valid_split(h0_accepts=100))
+        cache_oracle.fit(valid_split(h0_train=100, h1_train=50))
 
         self.assertIs(cache_oracle.scorer, active_scorer)
         self.assertEqual(cache_oracle.threshold, Threshold(0.4))
         self.assertEqual(cache_oracle.activation_status["threshold_version"], 3)
         self.assertFalse(cache_oracle.activation_status["activation_gate_passed"])
+        self.assertEqual(cache_oracle.activation_status["activation_gate_reason"], "min_train_total_not_met")
+        fit_result = cache_oracle.last_fit_result
+        self.assertIsNotNone(fit_result)
+        self.assertEqual(fit_result.threshold, Threshold(0.9))
+        self.assertEqual(fit_result.metadata["candidate_threshold"], Threshold(0.9))
+        self.assertEqual(fit_result.metadata["active_threshold"], Threshold(0.4))
 
     def test_no_previous_threshold_failed_gate_keeps_abstain_behavior(self) -> None:
         vectors = StaticVectorStore([entry("candidate")])

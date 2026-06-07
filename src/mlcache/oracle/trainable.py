@@ -469,14 +469,20 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             split=split,
             metadata=split.metadata,
         )
-        fit_metadata = {
+        fit_metadata_base = {
             **split.metadata,
             **gate.metadata,
+            "candidate_threshold": threshold,
             "activation_gate_passed": gate.passed,
             "activation_gate_reason": gate.reason,
         }
 
         with self._fit_lock:
+            active_threshold = threshold if gate.passed else self._threshold
+            fit_metadata = {
+                **fit_metadata_base,
+                "active_threshold": active_threshold,
+            }
             self._fit_result = OracleFitResult(
                 scorer=str(new_scorer.name),
                 threshold=threshold,
@@ -516,7 +522,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                     threshold,
                     scorer=new_scorer.name,
                     scope=ThresholdScope.GLOBAL,
-                    context=split.metadata,
+                    context=fit_metadata,
                 )
             except Exception:
                 pass
@@ -835,15 +841,20 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             threshold=threshold,
             calibration_h0_scores=h0_scores,
         )
-        recalibration_metadata = {
+        recalibration_metadata_base = {
             **metadata,
             **gate.metadata,
+            "candidate_threshold": threshold,
             "activation_gate_passed": gate.passed,
             "activation_gate_reason": gate.reason,
         }
 
         if not gate.passed:
             with self._fit_lock:
+                recalibration_metadata = {
+                    **recalibration_metadata_base,
+                    "active_threshold": self._threshold,
+                }
                 config = self._activation_config()
                 if config.deactivate_on_failed_refit and self._threshold is None:
                     self._semantic_hits_disabled = True
@@ -856,6 +867,10 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             return None
 
         with self._fit_lock:
+            recalibration_metadata = {
+                **recalibration_metadata_base,
+                "active_threshold": threshold,
+            }
             self._threshold = threshold
             self._threshold_version += 1
             self._semantic_hits_disabled = False

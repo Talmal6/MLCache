@@ -1,6 +1,7 @@
 """Compatibility wrapper for the old flat oracle module."""
 
 from mlcache.oracle import (
+    ActivationGateResult,
     OracleFitResult,
     OracleJudgeFeedback,
     OracleRuntimeSnapshot,
@@ -10,6 +11,7 @@ from mlcache.oracle import (
 )
 
 __all__ = [
+    "ActivationGateResult",
     "OracleFitResult",
     "OracleJudgeFeedback",
     "OracleRuntimeSnapshot",
@@ -17,4 +19,3 @@ __all__ = [
     "SemanticCacheOracle",
     "TrainableSemanticCacheOracle",
 ]
-
