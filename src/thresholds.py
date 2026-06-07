@@ -2,7 +2,14 @@
 
 from mlcache.calibration import (
     CalibrationExample,
+    DefaultQueryLevelCalibrationBuilder,
     NPThresholdCalibrator,
+    QueryCalibrationCandidate,
+    QueryCalibrationDataset,
+    QueryCalibrationDecision,
+    QueryCalibrationRecord,
+    QueryLevelCalibrationResult,
+    QueryLevelCalibrator,
     ThresholdCalibrationRequest,
     ThresholdProvider,
     ThresholdScope,
@@ -11,10 +18,16 @@ from mlcache.calibration import (
 
 __all__ = [
     "CalibrationExample",
+    "DefaultQueryLevelCalibrationBuilder",
     "NPThresholdCalibrator",
+    "QueryCalibrationCandidate",
+    "QueryCalibrationDataset",
+    "QueryCalibrationDecision",
+    "QueryCalibrationRecord",
+    "QueryLevelCalibrationResult",
+    "QueryLevelCalibrator",
     "ThresholdCalibrationRequest",
     "ThresholdProvider",
     "ThresholdScope",
     "wilson_upper_bound",
 ]
-
