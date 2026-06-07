@@ -14,6 +14,13 @@ class NormalizedHadamardFeatureBuilderTests(unittest.TestCase):
         self.assertEqual(features.abs_diff, ())
         self.assertEqual(features.concat, ())
 
+    def test_normalized_hadamard_features_include_metadata(self) -> None:
+        features = NormalizedHadamardFeatureBuilder().build([3, 4], [4, 0])
+
+        self.assertEqual(features.values["feature_type"], "normalized_hadamard")
+        self.assertEqual(features.values["embedding_dim"], 2)
+        self.assertEqual(features.values["dtype"], "float64")
+
     def test_normalized_hadamard_default_kind(self) -> None:
         self.assertEqual(NormalizedHadamardFeatureBuilder().default_kind(), PairFeatureKind.HADAMARD)
 

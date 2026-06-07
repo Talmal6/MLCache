@@ -22,7 +22,15 @@ class NormalizedHadamardFeatureBuilder(PairFeatureBuilder):
 
         hadamard = tuple(float(q * c) for q, c in zip(query, candidate))
         cosine = Score(float(sum(hadamard)))
-        return PairFeatures(cosine=cosine, hadamard=hadamard)
+        return PairFeatures(
+            cosine=cosine,
+            hadamard=hadamard,
+            values={
+                "feature_type": "normalized_hadamard",
+                "embedding_dim": len(hadamard),
+                "dtype": "float64",
+            },
+        )
 
     def default_kind(self) -> PairFeatureKind:
         return PairFeatureKind.HADAMARD
@@ -35,4 +43,3 @@ class NormalizedHadamardFeatureBuilder(PairFeatureBuilder):
             raise ValueError(f"{name} must not be a zero vector")
         norm = sqrt(norm_sq)
         return tuple(float(value / norm) for value in values)
-

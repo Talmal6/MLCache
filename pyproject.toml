@@ -1,7 +1,7 @@
 [project]
 name = "semantic-desider"
 version = "0.1.0"
-description = "Interface-only semantic cache oracle contracts."
+description = "Correctness-controlled online semantic cache contracts and runtime boundaries."
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.23",
@@ -11,6 +11,9 @@ dependencies = [
 ml = [
     "scikit-learn>=1.2",
     "xgboost>=1.7",
+]
+dev = [
+    "pytest>=7",
 ]
 
 [build-system]
