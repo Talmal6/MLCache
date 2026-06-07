@@ -42,6 +42,7 @@ from mlcache.online import (
     WindowedOnlineStoppingController,
 )
 from mlcache.oracle import (
+    ActivationGateResult,
     OracleFitResult,
     OracleJudgeFeedback,
     OracleRuntimeSnapshot,
@@ -99,6 +100,7 @@ from mlcache.semantic_types import (
 __all__ = [
     "AuditEvent",
     "AuditLogger",
+    "ActivationGateResult",
     "CacheEntry",
     "CacheGatewayResult",
     "CacheKey",

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from threading import RLock, Thread
-from typing import Any
+from typing import Any, Sequence
 
 from mlcache.calibration import ThresholdCalibrationRequest, ThresholdProvider, ThresholdScope, wilson_upper_bound
 from mlcache.features import PairFeatureBuilder, PairFeatures
@@ -19,9 +20,10 @@ from mlcache.feedback import (
 )
 from mlcache.online import OnlineBatch, OnlineUpdater, StopStatus
 from mlcache.oracle.base import SemanticCacheOracle
-from mlcache.oracle.fit import OracleFitResult
+from mlcache.oracle.fit import ActivationGateResult, OracleFitResult
 from mlcache.oracle.runtime import OracleJudgeFeedback, OracleRuntimeSnapshot, OracleScoredResult
 from mlcache.policies.refit import (
+    ConservativeRefitConfig,
     ConservativeRefitPolicy,
     RefitAction,
     RefitPolicy,
@@ -111,6 +113,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         self._threshold_version = 0
         self._semantic_hits_disabled = False
         self._fit_result: OracleFitResult | None = None
+        self._activation_metadata: dict[str, Any] = {}
         self._last_refit_decision: RefitPolicyDecision | None = None
         self._new_h0_since_fit = 0
         self._new_h1_since_fit = 0
@@ -134,9 +137,32 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             return self._fit_result
 
     @property
+    def last_fit_result(self) -> OracleFitResult | None:
+        return self.fit_result
+
+    @property
     def threshold(self) -> Threshold | None:
         with self._fit_lock:
             return self._threshold
+
+    @property
+    def semantic_hits_disabled(self) -> bool:
+        with self._fit_lock:
+            return self._semantic_hits_disabled
+
+    @property
+    def activation_status(self) -> dict[str, Any]:
+        with self._fit_lock:
+            metadata = dict(self._fit_result.metadata) if self._fit_result is not None else {}
+            metadata.update(self._activation_metadata)
+            metadata.update(
+                {
+                    "threshold": None if self._threshold is None else float(self._threshold),
+                    "threshold_version": self._threshold_version,
+                    "semantic_hits_disabled": self._semantic_hits_disabled,
+                }
+            )
+            return metadata
 
     @property
     def last_refit_decision(self) -> RefitPolicyDecision | None:
@@ -437,12 +463,20 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 context=split.metadata,
             )
         )
+        gate = self._check_activation_gate(
+            threshold=threshold,
+            calibration_h0_scores=h0_scores,
+            split=split,
+            metadata=split.metadata,
+        )
+        fit_metadata = {
+            **split.metadata,
+            **gate.metadata,
+            "activation_gate_passed": gate.passed,
+            "activation_gate_reason": gate.reason,
+        }
 
         with self._fit_lock:
-            self.scorer = new_scorer
-            self._threshold = threshold
-            self._threshold_version += 1
-            self._semantic_hits_disabled = False
             self._fit_result = OracleFitResult(
                 scorer=str(new_scorer.name),
                 threshold=threshold,
@@ -451,8 +485,24 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 n_h1_train=len(split.h1_train),
                 n_h0_calib=len(split.h0_calib),
                 n_h1_calib=len(split.h1_calib),
-                metadata=split.metadata,
+                metadata=fit_metadata,
             )
+            self._activation_metadata = dict(fit_metadata)
+            if not gate.passed:
+                config = self._activation_config()
+                if config.deactivate_on_failed_refit:
+                    self._semantic_hits_disabled = True
+                self._last_refit_decision = RefitPolicyDecision(
+                    action=RefitAction.NOOP,
+                    reason="activation_gate_failed",
+                    metadata=fit_metadata,
+                )
+                return
+
+            self.scorer = new_scorer
+            self._threshold = threshold
+            self._threshold_version += 1
+            self._semantic_hits_disabled = False
             self._new_h0_since_fit = 0
             self._new_h1_since_fit = 0
             self._new_h0_since_calibration = 0
@@ -476,6 +526,112 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             exc = self._fit_exception
         if exc is not None:
             raise exc
+
+    def _check_activation_gate(
+        self,
+        *,
+        threshold: Threshold,
+        calibration_h0_scores: Sequence[Score],
+        split: TrainCalibEvalSplit,
+        metadata: dict[str, Any],
+    ) -> ActivationGateResult:
+        del metadata
+        return self._activation_gate_from_counts(
+            threshold=threshold,
+            calibration_h0_scores=calibration_h0_scores,
+            n_h0_train=len(split.h0_train),
+            n_h1_train=len(split.h1_train),
+            n_h0_calib=len(split.h0_calib),
+            n_h1_calib=len(split.h1_calib),
+            require_train_gates=True,
+            require_calibration_h1=True,
+        )
+
+    def _check_recalibration_gate(
+        self,
+        *,
+        threshold: Threshold,
+        calibration_h0_scores: Sequence[Score],
+    ) -> ActivationGateResult:
+        return self._activation_gate_from_counts(
+            threshold=threshold,
+            calibration_h0_scores=calibration_h0_scores,
+            n_h0_train=0,
+            n_h1_train=0,
+            n_h0_calib=len(calibration_h0_scores),
+            n_h1_calib=0,
+            require_train_gates=False,
+            require_calibration_h1=False,
+        )
+
+    def _activation_gate_from_counts(
+        self,
+        *,
+        threshold: Threshold,
+        calibration_h0_scores: Sequence[Score],
+        n_h0_train: int,
+        n_h1_train: int,
+        n_h0_calib: int,
+        n_h1_calib: int,
+        require_train_gates: bool,
+        require_calibration_h1: bool,
+    ) -> ActivationGateResult:
+        config = self._activation_config()
+        train_total = int(n_h0_train) + int(n_h1_train)
+        threshold_is_finite = isfinite(float(threshold))
+        calibration_h0_accepts = sum(
+            1 for score in calibration_h0_scores if self._predict_score(score, threshold, self.tie_mode)
+        )
+        empirical_fpr = (
+            None if n_h0_calib <= 0 else float(calibration_h0_accepts) / float(n_h0_calib)
+        )
+        wilson_upper = wilson_upper_bound(
+            int(calibration_h0_accepts),
+            int(n_h0_calib),
+            z=config.wilson_confidence_z,
+        )
+        allowed_fpr_bound = self.target_false_accept_rate + config.fpr_wilson_margin
+
+        reason: str | None = None
+        if require_train_gates and train_total < config.min_train_total:
+            reason = "min_train_total_not_met"
+        elif require_train_gates and n_h0_train < config.min_train_h0:
+            reason = "min_train_h0_not_met"
+        elif require_train_gates and n_h1_train < config.min_train_h1:
+            reason = "min_train_h1_not_met"
+        elif n_h0_calib < config.min_calibration_h0:
+            reason = "min_calibration_h0_not_met"
+        elif require_calibration_h1 and n_h1_calib < config.min_calibration_h1:
+            reason = "min_calibration_h1_not_met"
+        elif config.require_finite_threshold and not threshold_is_finite:
+            reason = "threshold_not_finite"
+        elif wilson_upper is None:
+            reason = "wilson_upper_fpr_unavailable"
+        elif float(wilson_upper) > float(allowed_fpr_bound):
+            reason = "wilson_upper_fpr_exceeds_bound"
+
+        passed = reason is None
+        diagnostics = {
+            "train_total": train_total,
+            "n_h0_train": int(n_h0_train),
+            "n_h1_train": int(n_h1_train),
+            "n_h0_calib": int(n_h0_calib),
+            "n_h1_calib": int(n_h1_calib),
+            "calibration_h0_accepts": int(calibration_h0_accepts),
+            "empirical_calibration_fpr": empirical_fpr,
+            "wilson_upper_fpr": wilson_upper,
+            "allowed_fpr_bound": allowed_fpr_bound,
+            "threshold_is_finite": threshold_is_finite,
+            "activation_gate_passed": passed,
+            "activation_gate_reason": reason,
+        }
+        return ActivationGateResult(passed=passed, reason=reason, metadata=diagnostics)
+
+    def _activation_config(self) -> ConservativeRefitConfig:
+        config = getattr(self.refit_policy, "config", None)
+        if isinstance(config, ConservativeRefitConfig):
+            return config
+        return ConservativeRefitConfig()
 
     def update_online(self, batch: OnlineBatch) -> StopStatus:
         if self.online_updater is None:
@@ -558,8 +714,8 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 return decision
             skipped = RefitPolicyDecision(
                 action=RefitAction.NOOP,
-                reason="threshold_recalibration_not_ready",
-                metadata=decision.metadata,
+                reason="threshold_recalibration_not_activated",
+                metadata=self.activation_status,
             )
             with self._fit_lock:
                 self._last_refit_decision = skipped
@@ -675,11 +831,35 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 context=metadata,
             )
         )
+        gate = self._check_recalibration_gate(
+            threshold=threshold,
+            calibration_h0_scores=h0_scores,
+        )
+        recalibration_metadata = {
+            **metadata,
+            **gate.metadata,
+            "activation_gate_passed": gate.passed,
+            "activation_gate_reason": gate.reason,
+        }
+
+        if not gate.passed:
+            with self._fit_lock:
+                config = self._activation_config()
+                if config.deactivate_on_failed_refit and self._threshold is None:
+                    self._semantic_hits_disabled = True
+                self._activation_metadata = dict(recalibration_metadata)
+                self._last_refit_decision = RefitPolicyDecision(
+                    action=RefitAction.NOOP,
+                    reason="threshold_activation_gate_failed",
+                    metadata=recalibration_metadata,
+                )
+            return None
 
         with self._fit_lock:
             self._threshold = threshold
             self._threshold_version += 1
             self._semantic_hits_disabled = False
+            self._activation_metadata = dict(recalibration_metadata)
             self._new_h0_since_calibration = 0
             self._decisions_since_calibration = 0
             self._reset_monitor_counts()
@@ -690,7 +870,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                     threshold,
                     scorer=scorer_name,
                     scope=ThresholdScope.GLOBAL,
-                    context=metadata,
+                    context=recalibration_metadata,
                 )
             except Exception:
                 pass
@@ -722,6 +902,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             metadata={
                 **metadata,
                 "source": "decide_auto_refit",
+                "split_source": "legacy_resplit",
                 "n_h0_total": len(h0_rows),
                 "n_h1_total": len(h1_rows),
             },

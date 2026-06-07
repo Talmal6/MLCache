@@ -9,6 +9,13 @@ from mlcache.semantic_types import Threshold
 
 
 @dataclass(frozen=True, slots=True)
+class ActivationGateResult:
+    passed: bool
+    reason: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class OracleFitResult:
     scorer: str
     threshold: Threshold
@@ -18,4 +25,3 @@ class OracleFitResult:
     n_h0_calib: int
     n_h1_calib: int
     metadata: dict[str, Any] = field(default_factory=dict)
-

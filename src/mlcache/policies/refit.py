@@ -94,6 +94,15 @@ class ConservativeRefitConfig:
     min_h0_for_fit: int = 100
     min_h1_for_fit: int = 50
     min_h0_for_calibration: int = 100
+    min_train_total: int = 1200
+    min_train_h0: int = 100
+    min_train_h1: int = 50
+    min_calibration_h0: int = 500
+    min_calibration_h1: int = 50
+    wilson_confidence_z: float = 1.96
+    fpr_wilson_margin: float = 0.03
+    require_finite_threshold: bool = True
+    deactivate_on_failed_refit: bool = False
     min_new_h0_for_calibration: int = 25
     min_new_h0_for_refit: int = 50
     min_new_h1_for_refit: int = 50
@@ -277,6 +286,11 @@ class ConservativeRefitPolicy(RefitPolicy):
             "min_h0_for_fit",
             "min_h1_for_fit",
             "min_h0_for_calibration",
+            "min_train_total",
+            "min_train_h0",
+            "min_train_h1",
+            "min_calibration_h0",
+            "min_calibration_h1",
             "min_new_h0_for_calibration",
             "min_new_h0_for_refit",
             "min_new_h1_for_refit",
@@ -313,6 +327,10 @@ class ConservativeRefitPolicy(RefitPolicy):
             raise ValueError("fpr_margin must be non-negative")
         if self.config.tpr_drop_margin < 0.0:
             raise ValueError("tpr_drop_margin must be non-negative")
+        if self.config.wilson_confidence_z <= 0.0:
+            raise ValueError("wilson_confidence_z must be positive")
+        if self.config.fpr_wilson_margin < 0.0:
+            raise ValueError("fpr_wilson_margin must be non-negative")
 
     @staticmethod
     def _validate_context(context: RefitPolicyContext) -> None:
