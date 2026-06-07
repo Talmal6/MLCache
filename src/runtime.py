@@ -3,6 +3,7 @@
 from mlcache.runtime import (
     MLCacheRuntime,
     MLCacheRuntimeConfig,
+    QueryLevelRuntimeConfig,
     RuntimeRefitConfig,
     SemanticCacheRuntime,
     ShadowRuntimeConfig,
@@ -12,6 +13,7 @@ from mlcache.runtime import (
 __all__ = [
     "MLCacheRuntime",
     "MLCacheRuntimeConfig",
+    "QueryLevelRuntimeConfig",
     "RuntimeRefitConfig",
     "SemanticCacheRuntime",
     "ShadowRuntimeConfig",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from mlcache.cache import KVStore, SemanticCacheGateway
-from mlcache.calibration import ThresholdProvider
+from mlcache.calibration import QueryCalibrationRecordStore, ThresholdProvider
 from mlcache.features import PairFeatureBuilder
 from mlcache.feedback import (
     DefaultShadowTopKCollector,
@@ -16,11 +16,19 @@ from mlcache.feedback import (
 from mlcache.observability import AuditLogger, DiagnosticsReporter, MetricsSink
 from mlcache.online import OnlineUpdater
 from mlcache.oracle import TrainableSemanticCacheOracle
-from mlcache.policies import RefitPolicy
+from mlcache.policies import (
+    InMemoryQueryLevelShadowDecisionStore,
+    QueryLevelLearnedPolicy,
+    QueryLevelPolicyConfig,
+    QueryLevelPolicyMode,
+    QueryLevelShadowDecisionStore,
+    RefitPolicy,
+)
 from mlcache.retrieval import VectorStore
 from mlcache.runtime.config import MLCacheRuntimeConfig
 from mlcache.runtime.runtime import MLCacheRuntime
 from mlcache.scorers import SemanticScorer
+from mlcache.semantic_types import Threshold
 
 
 def build_mlcache_runtime(
@@ -38,10 +46,16 @@ def build_mlcache_runtime(
     audit_logger: AuditLogger | None = None,
     metrics_sink: MetricsSink | None = None,
     diagnostics_reporter: DiagnosticsReporter | None = None,
+    query_level_policy: QueryLevelLearnedPolicy | None = None,
+    query_level_shadow_store: QueryLevelShadowDecisionStore | None = None,
+    query_record_store: QueryCalibrationRecordStore | None = None,
+    query_level_threshold: Threshold | None = None,
     config: MLCacheRuntimeConfig | None = None,
 ) -> MLCacheRuntime:
     runtime_config = config or MLCacheRuntimeConfig()
     collector = shadow_collector
+    ql_policy = query_level_policy
+    ql_shadow_store = query_level_shadow_store
 
     if runtime_config.shadow.enabled and collector is None:
         if judge is None:
@@ -60,6 +74,29 @@ def build_mlcache_runtime(
                 collect_uncertain=runtime_config.shadow.collect_uncertain,
             ),
         )
+
+    if runtime_config.query_level.enabled:
+        mode = QueryLevelPolicyMode(runtime_config.query_level.mode)
+        if mode == QueryLevelPolicyMode.ACTIVE:
+            raise NotImplementedError("active query-level serving is not implemented")
+        if mode == QueryLevelPolicyMode.SHADOW:
+            if query_record_store is None:
+                raise ValueError("query-level shadow mode requires a QueryCalibrationRecordStore")
+            threshold = (
+                query_level_threshold
+                if query_level_threshold is not None
+                else runtime_config.query_level.threshold
+            )
+            if ql_policy is None:
+                ql_policy = QueryLevelLearnedPolicy(
+                    threshold=threshold,
+                    config=QueryLevelPolicyConfig(
+                        mode=QueryLevelPolicyMode.SHADOW,
+                        require_threshold=runtime_config.query_level.require_threshold,
+                    ),
+                )
+            if ql_shadow_store is None:
+                ql_shadow_store = InMemoryQueryLevelShadowDecisionStore()
 
     oracle = TrainableSemanticCacheOracle(
         vector_store=vector_store,
@@ -88,5 +125,8 @@ def build_mlcache_runtime(
         audit_logger=audit_logger,
         metrics_sink=metrics_sink,
         diagnostics_reporter=diagnostics_reporter,
+        query_level_policy=ql_policy,
+        query_level_shadow_store=ql_shadow_store,
+        query_record_store=query_record_store,
         config=runtime_config,
     )

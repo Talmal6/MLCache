@@ -4,7 +4,16 @@ from mlcache.policies.base import CachePolicy, PolicyAction, PolicyContext, Poli
 from mlcache.policies.fallback import FallbackFirstPolicy
 from mlcache.policies.learned_direct import LearnedDirectPolicy
 from mlcache.policies.learned_veto import LearnedVetoPolicy
-from mlcache.policies.query_level import QueryLevelLearnedPolicy
+from mlcache.policies.query_level import (
+    QueryLevelLearnedPolicy,
+    QueryLevelPolicyConfig,
+    QueryLevelPolicyDecision,
+    QueryLevelPolicyMode,
+)
+from mlcache.policies.query_level_shadow import (
+    InMemoryQueryLevelShadowDecisionStore,
+    QueryLevelShadowDecisionStore,
+)
 from mlcache.policies.refit import (
     ConservativeRefitConfig,
     ConservativeRefitPolicy,
@@ -19,15 +28,19 @@ __all__ = [
     "ConservativeRefitConfig",
     "ConservativeRefitPolicy",
     "FallbackFirstPolicy",
+    "InMemoryQueryLevelShadowDecisionStore",
     "LearnedDirectPolicy",
     "LearnedVetoPolicy",
     "PolicyAction",
     "PolicyContext",
     "PolicyDecision",
     "QueryLevelLearnedPolicy",
+    "QueryLevelPolicyConfig",
+    "QueryLevelPolicyDecision",
+    "QueryLevelPolicyMode",
+    "QueryLevelShadowDecisionStore",
     "RefitAction",
     "RefitPolicy",
     "RefitPolicyContext",
     "RefitPolicyDecision",
 ]
-
