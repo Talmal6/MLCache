@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from mlcache.cache import KVStore, SemanticCacheGateway
-from mlcache.calibration import QueryCalibrationRecordStore, ThresholdProvider
+from mlcache.calibration import QueryCalibrationRecordBuilder, QueryCalibrationRecordStore, ThresholdProvider
 from mlcache.features import PairFeatureBuilder
 from mlcache.feedback import (
     DefaultShadowTopKCollector,
@@ -75,6 +75,9 @@ def build_mlcache_runtime(
                 calibration_every_n=runtime_config.shadow.calibration_every_n,
                 collect_uncertain=runtime_config.shadow.collect_uncertain,
             ),
+            query_record_builder=QueryCalibrationRecordBuilder() if query_record_store is not None else None,
+            query_record_store=query_record_store,
+            record_query_calibration=query_record_store is not None,
         )
 
     if query_level_threshold is not None:

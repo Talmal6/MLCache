@@ -1,9 +1,19 @@
 """Correctness-controlled online semantic cache contracts."""
 
-from mlcache.cache import CacheGatewayResult, ExternalSemanticCache, KVStore, SemanticCacheGateway
+from mlcache.cache import (
+    CacheGatewayResult,
+    ExternalSemanticCache,
+    FileKVStore,
+    InMemoryKVStore,
+    KVStore,
+    SemanticCacheGateway,
+)
 from mlcache.calibration import (
     CalibrationExample,
     DefaultQueryLevelCalibrationBuilder,
+    FileQueryCalibrationRecordStore,
+    FileThresholdProvider,
+    InMemoryThresholdProvider,
     NPThresholdCalibrator,
     QueryCalibrationCandidate,
     QueryCalibrationDataset,
@@ -65,6 +75,7 @@ from mlcache.policies import (
     ConservativeRefitConfig,
     ConservativeRefitPolicy,
     FallbackFirstPolicy,
+    FileQueryLevelShadowDecisionStore,
     LearnedDirectPolicy,
     LearnedVetoPolicy,
     InMemoryQueryLevelShadowDecisionStore,
@@ -81,7 +92,7 @@ from mlcache.policies import (
     RefitPolicyContext,
     RefitPolicyDecision,
 )
-from mlcache.retrieval import VectorSearchResult, VectorStore
+from mlcache.retrieval import FileVectorStore, InMemoryVectorStore, VectorSearchResult, VectorStore
 from mlcache.runtime import (
     MLCacheRuntime,
     MLCacheRuntimeConfig,
@@ -89,6 +100,7 @@ from mlcache.runtime import (
     RuntimeRefitConfig,
     SemanticCacheRuntime,
     ShadowRuntimeConfig,
+    build_local_mlcache_runtime,
     build_mlcache_runtime,
 )
 from mlcache.scorers import (
@@ -142,12 +154,20 @@ __all__ = [
     "EnsembleScorer",
     "ExternalSemanticCache",
     "FallbackFirstPolicy",
+    "FileKVStore",
+    "FileQueryCalibrationRecordStore",
+    "FileQueryLevelShadowDecisionStore",
+    "FileThresholdProvider",
+    "FileVectorStore",
     "FeedbackEvent",
     "FIFOTrainingExampleEvictionPolicy",
     "InMemoryJudgeTrainingStore",
+    "InMemoryKVStore",
     "InMemoryQueryCalibrationRecordStore",
     "InMemoryQueryLevelShadowDecisionStore",
     "InMemorySplitJudgeTrainingStore",
+    "InMemoryThresholdProvider",
+    "InMemoryVectorStore",
     "InputSpace",
     "JudgeDecision",
     "JudgeLabel",
@@ -234,6 +254,7 @@ __all__ = [
     "VectorStore",
     "WindowedOnlineStoppingController",
     "XGBoostScorer",
+    "build_local_mlcache_runtime",
     "build_mlcache_runtime",
     "wilson_upper_bound",
 ]

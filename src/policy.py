@@ -2,6 +2,7 @@
 
 from mlcache.policies import (
     CachePolicy,
+    FileQueryLevelShadowDecisionStore,
     InMemoryQueryLevelShadowDecisionStore,
     PolicyAction,
     PolicyContext,
@@ -15,6 +16,7 @@ from mlcache.policies import (
 
 __all__ = [
     "CachePolicy",
+    "FileQueryLevelShadowDecisionStore",
     "InMemoryQueryLevelShadowDecisionStore",
     "PolicyAction",
     "PolicyContext",

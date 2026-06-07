@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import replace
+from pathlib import Path
 
+from mlcache.persistence import (
+    atomic_write_json,
+    decode_query_level_policy_decision,
+    encode_query_level_policy_decision,
+    read_json_or_default,
+)
 from mlcache.policies.query_level import QueryLevelPolicyDecision
 
 
@@ -49,4 +56,43 @@ class InMemoryQueryLevelShadowDecisionStore(QueryLevelShadowDecisionStore):
         return replace(decision, metadata=dict(decision.metadata))
 
 
-__all__ = ["InMemoryQueryLevelShadowDecisionStore", "QueryLevelShadowDecisionStore"]
+class FileQueryLevelShadowDecisionStore(InMemoryQueryLevelShadowDecisionStore):
+    """Bounded FIFO JSON-backed query-level shadow decision store."""
+
+    def __init__(self, path: str | Path, *, max_decisions: int = 100_000) -> None:
+        self.path = Path(path)
+        super().__init__(max_decisions=max_decisions)
+        data = read_json_or_default(self.path, {"decisions": []})
+        decoded = tuple(decode_query_level_policy_decision(item) for item in data.get("decisions", ()))
+        self._decisions = [
+            self._copy_decision(decision)
+            for decision in decoded[-self.max_decisions :]
+        ]
+
+    def add(self, decision: QueryLevelPolicyDecision) -> None:
+        super().add(decision)
+        self._persist()
+
+    def clear(self) -> None:
+        super().clear()
+        self._persist()
+
+    def _persist(self) -> None:
+        atomic_write_json(
+            self.path,
+            {
+                "format": "mlcache.file_query_level_shadow_decision_store.v1",
+                "max_decisions": self.max_decisions,
+                "decisions": [
+                    encode_query_level_policy_decision(decision)
+                    for decision in self._decisions
+                ],
+            },
+        )
+
+
+__all__ = [
+    "FileQueryLevelShadowDecisionStore",
+    "InMemoryQueryLevelShadowDecisionStore",
+    "QueryLevelShadowDecisionStore",
+]

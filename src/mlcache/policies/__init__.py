@@ -11,6 +11,7 @@ from mlcache.policies.query_level import (
     QueryLevelPolicyMode,
 )
 from mlcache.policies.query_level_shadow import (
+    FileQueryLevelShadowDecisionStore,
     InMemoryQueryLevelShadowDecisionStore,
     QueryLevelShadowDecisionStore,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "ConservativeRefitConfig",
     "ConservativeRefitPolicy",
     "FallbackFirstPolicy",
+    "FileQueryLevelShadowDecisionStore",
     "InMemoryQueryLevelShadowDecisionStore",
     "LearnedDirectPolicy",
     "LearnedVetoPolicy",

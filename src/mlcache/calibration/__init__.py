@@ -1,7 +1,11 @@
 """Threshold and query-level calibration contracts."""
 
 from mlcache.calibration.np_threshold import NPThresholdCalibrator, ThresholdProvider
-from mlcache.calibration.query_record_store import InMemoryQueryCalibrationRecordStore, QueryCalibrationRecordStore
+from mlcache.calibration.query_record_store import (
+    FileQueryCalibrationRecordStore,
+    InMemoryQueryCalibrationRecordStore,
+    QueryCalibrationRecordStore,
+)
 from mlcache.calibration.query_records import QueryCalibrationRecordBuilder
 from mlcache.calibration.query_level import (
     DefaultQueryLevelCalibrationBuilder,
@@ -13,6 +17,7 @@ from mlcache.calibration.query_level import (
     QueryLevelCalibrationConfig,
     QueryLevelCalibrator,
 )
+from mlcache.calibration.threshold_store import FileThresholdProvider, InMemoryThresholdProvider
 from mlcache.calibration.types import CalibrationExample, ThresholdCalibrationRequest, ThresholdScope
 from mlcache.calibration.wilson import wilson_upper_bound
 
@@ -20,6 +25,9 @@ __all__ = [
     "CalibrationExample",
     "NPThresholdCalibrator",
     "DefaultQueryLevelCalibrationBuilder",
+    "FileQueryCalibrationRecordStore",
+    "FileThresholdProvider",
+    "InMemoryThresholdProvider",
     "QueryCalibrationCandidate",
     "QueryCalibrationDataset",
     "QueryCalibrationDecision",

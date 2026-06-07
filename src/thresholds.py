@@ -3,6 +3,9 @@
 from mlcache.calibration import (
     CalibrationExample,
     DefaultQueryLevelCalibrationBuilder,
+    FileQueryCalibrationRecordStore,
+    FileThresholdProvider,
+    InMemoryThresholdProvider,
     NPThresholdCalibrator,
     QueryCalibrationCandidate,
     QueryCalibrationDataset,
@@ -23,6 +26,9 @@ from mlcache.calibration import (
 __all__ = [
     "CalibrationExample",
     "DefaultQueryLevelCalibrationBuilder",
+    "FileQueryCalibrationRecordStore",
+    "FileThresholdProvider",
+    "InMemoryThresholdProvider",
     "NPThresholdCalibrator",
     "InMemoryQueryCalibrationRecordStore",
     "QueryCalibrationCandidate",
