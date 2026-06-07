@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from mlcache.cache import KVStore, SemanticCacheGateway
 from mlcache.calibration import QueryCalibrationRecordStore, ThresholdProvider
 from mlcache.features import PairFeatureBuilder
@@ -75,27 +77,37 @@ def build_mlcache_runtime(
             ),
         )
 
+    if query_level_threshold is not None:
+        runtime_config = replace(
+            runtime_config,
+            query_level=replace(runtime_config.query_level, threshold=query_level_threshold),
+        )
+
     if runtime_config.query_level.enabled:
         mode = QueryLevelPolicyMode(runtime_config.query_level.mode)
-        if mode == QueryLevelPolicyMode.ACTIVE:
-            raise NotImplementedError("active query-level serving is not implemented")
-        if mode == QueryLevelPolicyMode.SHADOW:
+        if mode in {QueryLevelPolicyMode.ACTIVE, QueryLevelPolicyMode.SHADOW}:
             if query_record_store is None:
-                raise ValueError("query-level shadow mode requires a QueryCalibrationRecordStore")
+                raise ValueError(f"query-level {mode.value} mode requires a QueryCalibrationRecordStore")
             threshold = (
-                query_level_threshold
-                if query_level_threshold is not None
-                else runtime_config.query_level.threshold
+                runtime_config.query_level.threshold
+                if runtime_config.query_level.threshold is not None
+                else (ql_policy.threshold if ql_policy is not None else None)
             )
+            if (
+                mode == QueryLevelPolicyMode.ACTIVE
+                and runtime_config.query_level.active_requires_threshold
+                and threshold is None
+            ):
+                raise ValueError("active query-level serving requires a query-level threshold")
             if ql_policy is None:
                 ql_policy = QueryLevelLearnedPolicy(
                     threshold=threshold,
                     config=QueryLevelPolicyConfig(
-                        mode=QueryLevelPolicyMode.SHADOW,
+                        mode=mode,
                         require_threshold=runtime_config.query_level.require_threshold,
                     ),
                 )
-            if ql_shadow_store is None:
+            if mode == QueryLevelPolicyMode.SHADOW and ql_shadow_store is None:
                 ql_shadow_store = InMemoryQueryLevelShadowDecisionStore()
 
     oracle = TrainableSemanticCacheOracle(

@@ -327,9 +327,10 @@ class QueryLevelPolicyShadowTests(unittest.TestCase):
         self.assertEqual(shadowed.decision.status, direct.decision.status)
         self.assertEqual(shadowed.decision.cache_key, direct.decision.cache_key)
 
-    def test_active_query_level_mode_raises_clear_error(self) -> None:
-        with self.assertRaisesRegex(NotImplementedError, "active query-level serving is not implemented"):
-            shadow_runtime(active=True)
+    def test_active_query_level_mode_constructs_with_required_dependencies(self) -> None:
+        runtime, _, _ = shadow_runtime(active=True)
+
+        self.assertEqual(runtime.config.query_level.mode, QueryLevelPolicyMode.ACTIVE)
 
     def test_query_level_shadow_metrics_are_recorded(self) -> None:
         metrics = RecordingMetricsSink()

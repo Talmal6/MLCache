@@ -18,7 +18,16 @@ from mlcache.policies import (
 )
 from mlcache.retrieval import VectorStore
 from mlcache.runtime.config import MLCacheRuntimeConfig
-from mlcache.semantic_types import CacheEntry, CacheKey, CacheLookup, OracleDecisionStatus, Response, Threshold
+from mlcache.semantic_types import (
+    CacheEntry,
+    CacheKey,
+    CacheLookup,
+    OracleDecision,
+    OracleDecisionStatus,
+    Response,
+    ScorerName,
+    Threshold,
+)
 
 
 class MLCacheRuntime:
@@ -54,18 +63,21 @@ class MLCacheRuntime:
         self.query_level_shadow_store = query_level_shadow_store
         self.query_record_store = query_record_store
         self.config = config or MLCacheRuntimeConfig()
-        if self.config.query_level.enabled and self._query_level_mode() == QueryLevelPolicyMode.ACTIVE:
-            raise NotImplementedError("active query-level serving is not implemented")
         self._diagnostics: list[dict[str, Any]] = []
 
     def lookup(self, request: CacheLookup) -> Response | None:
         return self.lookup_with_decision(request).response
 
     def lookup_with_decision(self, request: CacheLookup) -> CacheGatewayResult:
-        result = self.gateway.lookup_with_decision(request)
-        self._emit_observability(request, result)
-        self._maybe_evaluate_query_level_shadow(request, result)
-        return result
+        pair_result = self.gateway.lookup_with_decision(request)
+        if self._query_level_active_enabled():
+            result = self._lookup_with_query_level_active(request, pair_result)
+            self._emit_observability(request, result)
+            return result
+
+        self._emit_observability(request, pair_result)
+        self._maybe_evaluate_query_level_shadow(request, pair_result)
+        return pair_result
 
     def put(self, entry: CacheEntry) -> CacheKey:
         return self.gateway.put(entry)
@@ -159,6 +171,383 @@ class MLCacheRuntime:
         self.metrics_sink.record("cache.lookup.miss", 1.0 if status == OracleDecisionStatus.MISS else 0.0, metadata)
         self.metrics_sink.record("cache.lookup.abstain", 1.0 if status == OracleDecisionStatus.ABSTAIN else 0.0, metadata)
         self.metrics_sink.record("cache.lookup.candidate_count", float(result.decision.candidate_count), metadata)
+
+    def _lookup_with_query_level_active(
+        self,
+        request: CacheLookup,
+        pair_result: CacheGatewayResult,
+    ) -> CacheGatewayResult:
+        metadata = self._query_level_active_base_metadata(pair_result)
+        if self.query_level_policy is None:
+            return self._query_level_active_no_record_or_policy_result(
+                pair_result=pair_result,
+                metadata=metadata,
+                reason="query_level_policy_missing",
+            )
+        if self.query_record_store is None:
+            return self._query_level_active_no_record_or_policy_result(
+                pair_result=pair_result,
+                metadata=metadata,
+                reason="query_level_record_missing",
+            )
+
+        try:
+            record = self._latest_query_calibration_record(request)
+            if record is None:
+                return self._query_level_active_no_record_or_policy_result(
+                    pair_result=pair_result,
+                    metadata=metadata,
+                    reason="query_level_record_missing",
+                )
+
+            threshold = self._query_level_threshold()
+            query_decision = self.query_level_policy.evaluate(
+                record,
+                threshold=threshold,
+                metadata={
+                    "source": "runtime_query_level_active",
+                    "serving_status": pair_result.decision.status.value,
+                    "serving_accepted": bool(pair_result.decision.accepted),
+                },
+            )
+            metadata.update(self._query_level_active_decision_metadata(query_decision))
+
+            if not query_decision.accepted:
+                return self._query_level_active_rejected_or_abstained_result(
+                    pair_result=pair_result,
+                    query_decision=query_decision,
+                    metadata=metadata,
+                )
+
+            cache_key = query_decision.selected_candidate_key
+            if cache_key is None:
+                return self._query_level_active_kv_miss_result(
+                    pair_result=pair_result,
+                    query_decision=query_decision,
+                    metadata=metadata,
+                    reason="query_level_selected_candidate_key_missing",
+                )
+
+            response = self.kv_store.get(cache_key)
+            if response is None:
+                self._remove_query_level_kv_miss_candidate(cache_key)
+                return self._query_level_active_kv_miss_result(
+                    pair_result=pair_result,
+                    query_decision=query_decision,
+                    metadata=metadata,
+                    reason="query_level_kv_key_missing_or_expired",
+                )
+
+            metadata.update(
+                {
+                    "query_level_reason": "query_level_policy_accepted",
+                    "reason": "query_level_policy_accepted",
+                    "fallback_used": False,
+                    "final_decision_source": "query_level_active",
+                    "query_level_kv_miss": False,
+                }
+            )
+            decision = self._oracle_decision_from_query_level(
+                query_decision,
+                accepted=True,
+                cache_key=cache_key,
+                status=OracleDecisionStatus.HIT,
+                reason="query_level_policy_accepted",
+            )
+            result = CacheGatewayResult(response=response, decision=decision, metadata=metadata)
+            self._emit_query_level_active_observability(metadata)
+            return result
+        except Exception as exc:
+            self._record_observability_failure("query_level_active", exc)
+            metadata.update(
+                {
+                    "query_level_status": OracleDecisionStatus.ABSTAIN.value,
+                    "query_level_accepted": False,
+                    "query_level_reason": "query_level_active_failed",
+                    "reason": "query_level_active_failed",
+                    "fallback_used": True,
+                    "final_decision_source": "query_level_active_fallback_pair_level",
+                    "query_level_error": repr(exc),
+                }
+            )
+            result = self._fallback_pair_level_result(pair_result, metadata)
+            self._emit_query_level_active_observability(metadata)
+            return result
+
+    def _query_level_active_no_record_or_policy_result(
+        self,
+        *,
+        pair_result: CacheGatewayResult,
+        metadata: dict[str, Any],
+        reason: str,
+    ) -> CacheGatewayResult:
+        metadata.update(
+            {
+                "query_level_status": OracleDecisionStatus.ABSTAIN.value,
+                "query_level_accepted": False,
+                "query_level_selected_candidate_key": None,
+                "query_level_selected_candidate_rank": None,
+                "query_level_selected_score": None,
+                "query_level_threshold": self._threshold_metadata_value(self._query_level_threshold()),
+                "query_level_reason": reason,
+                "reason": reason,
+                "query_level_kv_miss": False,
+            }
+        )
+        if self.config.query_level.fallback_to_pair_level_on_missing_record:
+            metadata.update(
+                {
+                    "fallback_used": True,
+                    "final_decision_source": "query_level_active_fallback_pair_level",
+                }
+            )
+            result = self._fallback_pair_level_result(pair_result, metadata)
+            self._emit_query_level_active_observability(metadata)
+            return result
+
+        metadata.update(
+            {
+                "fallback_used": False,
+                "final_decision_source": "query_level_active_no_fallback",
+            }
+        )
+        decision = self._query_level_no_response_decision(
+            status=OracleDecisionStatus.ABSTAIN,
+            reason=reason,
+            threshold=self._query_level_threshold(),
+        )
+        result = CacheGatewayResult(response=None, decision=decision, metadata=metadata)
+        self._emit_query_level_active_observability(metadata)
+        return result
+
+    def _query_level_active_rejected_or_abstained_result(
+        self,
+        *,
+        pair_result: CacheGatewayResult,
+        query_decision: QueryLevelPolicyDecision,
+        metadata: dict[str, Any],
+    ) -> CacheGatewayResult:
+        reason = query_decision.reason or "query_level_policy_not_accepted"
+        metadata.update(
+            {
+                "query_level_reason": reason,
+                "reason": reason,
+                "query_level_kv_miss": False,
+            }
+        )
+        if self.config.query_level.fallback_to_pair_level_on_abstain:
+            metadata.update(
+                {
+                    "fallback_used": True,
+                    "final_decision_source": "query_level_active_fallback_pair_level",
+                }
+            )
+            result = self._fallback_pair_level_result(pair_result, metadata)
+            self._emit_query_level_active_observability(metadata)
+            return result
+
+        metadata.update(
+            {
+                "fallback_used": False,
+                "final_decision_source": "query_level_active_no_fallback",
+            }
+        )
+        status = query_decision.status
+        if status == OracleDecisionStatus.HIT:
+            status = OracleDecisionStatus.MISS
+        decision = self._oracle_decision_from_query_level(
+            query_decision,
+            accepted=False,
+            cache_key=None,
+            status=status,
+            reason=reason,
+        )
+        result = CacheGatewayResult(response=None, decision=decision, metadata=metadata)
+        self._emit_query_level_active_observability(metadata)
+        return result
+
+    def _query_level_active_kv_miss_result(
+        self,
+        *,
+        pair_result: CacheGatewayResult,
+        query_decision: QueryLevelPolicyDecision,
+        metadata: dict[str, Any],
+        reason: str,
+    ) -> CacheGatewayResult:
+        metadata.update(
+            {
+                "query_level_reason": reason,
+                "reason": reason,
+                "query_level_kv_miss": True,
+            }
+        )
+        if self.config.query_level.fallback_to_pair_level_on_kv_miss:
+            metadata.update(
+                {
+                    "fallback_used": True,
+                    "final_decision_source": "query_level_active_fallback_pair_level",
+                }
+            )
+            result = self._fallback_pair_level_result(pair_result, metadata)
+            self._emit_query_level_active_observability(metadata)
+            return result
+
+        metadata.update(
+            {
+                "fallback_used": False,
+                "final_decision_source": "query_level_active_no_fallback",
+            }
+        )
+        decision = self._oracle_decision_from_query_level(
+            query_decision,
+            accepted=False,
+            cache_key=None,
+            status=OracleDecisionStatus.MISS,
+            reason=reason,
+        )
+        result = CacheGatewayResult(response=None, decision=decision, metadata=metadata)
+        self._emit_query_level_active_observability(metadata)
+        return result
+
+    def _fallback_pair_level_result(
+        self,
+        pair_result: CacheGatewayResult,
+        metadata: dict[str, Any],
+    ) -> CacheGatewayResult:
+        return CacheGatewayResult(
+            response=pair_result.response,
+            decision=pair_result.decision,
+            metadata={**pair_result.metadata, **metadata},
+        )
+
+    def _oracle_decision_from_query_level(
+        self,
+        query_decision: QueryLevelPolicyDecision,
+        *,
+        accepted: bool,
+        cache_key: CacheKey | None,
+        status: OracleDecisionStatus,
+        reason: str,
+    ) -> OracleDecision:
+        return OracleDecision(
+            status=status,
+            accepted=accepted,
+            cache_key=cache_key,
+            score=query_decision.selected_score,
+            threshold=query_decision.threshold,
+            scorer=ScorerName("QueryLevelLearnedPolicy"),
+            candidate_count=int(query_decision.metadata.get("candidate_count", 0)),
+            accepted_candidate_rank=query_decision.selected_candidate_rank if accepted else None,
+            reason=reason,
+            evidence={"query_level_policy": dict(query_decision.metadata)},
+        )
+
+    @staticmethod
+    def _query_level_no_response_decision(
+        *,
+        status: OracleDecisionStatus,
+        reason: str,
+        threshold: Threshold | None,
+    ) -> OracleDecision:
+        return OracleDecision(
+            status=status,
+            accepted=False,
+            cache_key=None,
+            score=None,
+            threshold=threshold,
+            scorer=ScorerName("QueryLevelLearnedPolicy"),
+            reason=reason,
+            evidence={"query_level_active": True},
+        )
+
+    def _remove_query_level_kv_miss_candidate(self, cache_key: CacheKey) -> None:
+        try:
+            self.oracle.remove(cache_key)
+        except Exception as exc:
+            self._record_observability_failure("query_level_active_invalidate", exc)
+
+    def _query_level_active_base_metadata(self, pair_result: CacheGatewayResult) -> dict[str, Any]:
+        return {
+            "query_level_active": True,
+            "pair_level_status": pair_result.decision.status.value,
+            "pair_level_accepted": bool(pair_result.decision.accepted),
+            "query_level_status": None,
+            "query_level_accepted": None,
+            "query_level_selected_candidate_key": None,
+            "query_level_selected_candidate_rank": None,
+            "query_level_selected_score": None,
+            "query_level_threshold": self._threshold_metadata_value(self._query_level_threshold()),
+            "query_level_reason": None,
+            "fallback_used": False,
+            "final_decision_source": None,
+        }
+
+    @staticmethod
+    def _query_level_active_decision_metadata(
+        query_decision: QueryLevelPolicyDecision,
+    ) -> dict[str, Any]:
+        return {
+            "query_level_status": query_decision.status.value,
+            "query_level_accepted": bool(query_decision.accepted),
+            "query_level_selected_candidate_key": (
+                str(query_decision.selected_candidate_key)
+                if query_decision.selected_candidate_key is not None
+                else None
+            ),
+            "query_level_selected_candidate_rank": query_decision.selected_candidate_rank,
+            "query_level_selected_score": (
+                float(query_decision.selected_score) if query_decision.selected_score is not None else None
+            ),
+            "query_level_threshold": (
+                float(query_decision.threshold) if query_decision.threshold is not None else None
+            ),
+        }
+
+    def _query_level_threshold(self) -> Threshold | None:
+        threshold = self.config.query_level.threshold
+        if threshold is not None:
+            return threshold
+        if self.query_level_policy is None:
+            return None
+        return self.query_level_policy.threshold
+
+    @staticmethod
+    def _threshold_metadata_value(threshold: Threshold | None) -> float | None:
+        return float(threshold) if threshold is not None else None
+
+    def _emit_query_level_active_observability(self, metadata: dict[str, Any]) -> None:
+        if self.metrics_sink is None:
+            return
+        try:
+            self._record_query_level_active_metrics(metadata)
+        except Exception as exc:
+            self._record_observability_failure("query_level_active_metrics", exc)
+
+    def _record_query_level_active_metrics(self, metadata: dict[str, Any]) -> None:
+        status = metadata.get("query_level_status")
+        query_accepted = bool(metadata.get("query_level_accepted"))
+        fallback_used = bool(metadata.get("fallback_used"))
+        kv_miss = bool(metadata.get("query_level_kv_miss"))
+        self.metrics_sink.record("cache.query_level_active.evaluated", 1.0, metadata)
+        self.metrics_sink.record("cache.query_level_active.accepted", 1.0 if query_accepted else 0.0, metadata)
+        self.metrics_sink.record(
+            "cache.query_level_active.rejected",
+            1.0 if status == OracleDecisionStatus.MISS.value else 0.0,
+            metadata,
+        )
+        self.metrics_sink.record(
+            "cache.query_level_active.abstain",
+            1.0 if status == OracleDecisionStatus.ABSTAIN.value else 0.0,
+            metadata,
+        )
+        self.metrics_sink.record("cache.query_level_active.fallback_used", 1.0 if fallback_used else 0.0, metadata)
+        self.metrics_sink.record("cache.query_level_active.kv_miss", 1.0 if kv_miss else 0.0, metadata)
+        selected_rank = metadata.get("query_level_selected_candidate_rank")
+        if selected_rank is not None:
+            self.metrics_sink.record("cache.query_level_active.selected_rank", float(selected_rank), metadata)
+        score = metadata.get("query_level_selected_score")
+        if score is not None:
+            self.metrics_sink.record("cache.query_level_active.score", float(score), metadata)
 
     def _maybe_evaluate_query_level_shadow(self, request: CacheLookup, result: CacheGatewayResult) -> None:
         if not self._query_level_shadow_enabled():
@@ -276,6 +665,10 @@ class MLCacheRuntime:
     def _query_level_shadow_enabled(self) -> bool:
         query_level = self.config.query_level
         return bool(query_level.enabled and self._query_level_mode() == QueryLevelPolicyMode.SHADOW)
+
+    def _query_level_active_enabled(self) -> bool:
+        query_level = self.config.query_level
+        return bool(query_level.enabled and self._query_level_mode() == QueryLevelPolicyMode.ACTIVE)
 
     def _query_level_mode(self) -> QueryLevelPolicyMode:
         return QueryLevelPolicyMode(self.config.query_level.mode)

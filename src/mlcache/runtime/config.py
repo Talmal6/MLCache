@@ -31,6 +31,10 @@ class QueryLevelRuntimeConfig:
     mode: QueryLevelPolicyMode = QueryLevelPolicyMode.DISABLED
     threshold: Threshold | None = None
     require_threshold: bool = True
+    fallback_to_pair_level_on_abstain: bool = True
+    fallback_to_pair_level_on_missing_record: bool = True
+    fallback_to_pair_level_on_kv_miss: bool = True
+    active_requires_threshold: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", QueryLevelPolicyMode(self.mode))

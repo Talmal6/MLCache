@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Sequence
 
 from mlcache.feedback.types import JudgeDecision, JudgeLabel, JudgeRequest
@@ -15,7 +15,7 @@ class JudgedPairExample:
     features: tuple[float, ...]
     request: JudgeRequest
     decision: JudgeDecision
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
