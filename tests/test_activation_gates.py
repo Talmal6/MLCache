@@ -1,7 +1,7 @@
 import unittest
 
 from mlcache.cache import SemanticCacheGateway
-from mlcache.calibration import ThresholdCalibrationRequest
+from mlcache.calibration import ThresholdCalibrationRequest, ThresholdProvider, ThresholdScope
 from mlcache.features import NormalizedHadamardFeatureBuilder
 from mlcache.feedback import (
     DefaultShadowTopKCollector,
@@ -194,6 +194,38 @@ class MappingJudge(SemanticReuseJudge):
         return JudgeResult(request=request, decision=JudgeDecision(label=self.labels[key]))
 
 
+class RecordingThresholdProvider(ThresholdProvider):
+    def __init__(self) -> None:
+        self.calls: list[tuple[Threshold, ScorerName, ThresholdScope, dict[str, object] | None]] = []
+        self.current = Threshold(0.0)
+
+    def get_threshold(
+        self,
+        *,
+        scorer: ScorerName,
+        scope: ThresholdScope = ThresholdScope.GLOBAL,
+        region_id=None,
+        cluster_id=None,
+        context: dict[str, object] | None = None,
+    ) -> Threshold:
+        del scorer, scope, region_id, cluster_id, context
+        return self.current
+
+    def set_threshold(
+        self,
+        threshold: Threshold,
+        *,
+        scorer: ScorerName,
+        scope: ThresholdScope = ThresholdScope.GLOBAL,
+        region_id=None,
+        cluster_id=None,
+        context: dict[str, object] | None = None,
+    ) -> None:
+        del region_id, cluster_id
+        self.current = threshold
+        self.calls.append((threshold, scorer, scope, context))
+
+
 def passing_config(**overrides: object) -> ConservativeRefitConfig:
     values = {
         "min_train_total": 1200,
@@ -255,6 +287,7 @@ def oracle(
     judge_training_store=None,
     shadow_collector=None,
     shadow_collection_enabled: bool = False,
+    threshold_provider: ThresholdProvider | None = None,
     top_k: int = 1,
 ) -> TrainableSemanticCacheOracle:
     instance = TrainableSemanticCacheOracle(
@@ -266,6 +299,7 @@ def oracle(
         judge_training_store=judge_training_store,
         shadow_collector=shadow_collector,
         shadow_collection_enabled=shadow_collection_enabled,
+        threshold_provider=threshold_provider,
         top_k=top_k,
     )
     instance._threshold = threshold
@@ -356,6 +390,34 @@ class ActivationGateTests(unittest.TestCase):
         self.assertFalse(status["activation_gate_passed"])
         self.assertEqual(status["activation_gate_reason"], "wilson_upper_fpr_exceeds_bound")
         self.assertGreater(status["wilson_upper_fpr"], status["allowed_fpr_bound"])
+
+    def test_threshold_provider_updates_only_when_gate_passes(self) -> None:
+        provider = RecordingThresholdProvider()
+
+        failed_refit = oracle(threshold_provider=provider)
+        failed_refit.fit(valid_split(h0_accepts=100))
+        self.assertEqual(provider.calls, [])
+
+        passed_refit = oracle(threshold_provider=provider)
+        passed_refit.fit(valid_split())
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(provider.calls[-1][0], Threshold(0.5))
+
+        failed_recalibration = oracle(threshold=Threshold(0.4), threshold_provider=provider)
+        failed_recalibration._recalibrate_threshold_from_rows(rows(499, 0.0), metadata={})
+        self.assertEqual(len(provider.calls), 1)
+
+        passed_recalibration = oracle(
+            threshold=Threshold(0.4),
+            scorer=GateScorer(threshold=0.6),
+            threshold_provider=provider,
+        )
+        passed_recalibration._recalibrate_threshold_from_rows(
+            h0_calibration_scores(total=500, accepts=25, threshold=0.6),
+            metadata={},
+        )
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(provider.calls[-1][0], Threshold(0.6))
 
     def test_failed_refit_does_not_replace_existing_scorer_or_threshold(self) -> None:
         active_scorer = GateScorer(threshold=0.4, name="active")
