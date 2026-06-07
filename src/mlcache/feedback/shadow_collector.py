@@ -7,12 +7,14 @@ from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Sequence
 
+from mlcache.calibration.query_record_store import QueryCalibrationRecordStore
+from mlcache.calibration.query_records import QueryCalibrationRecordBuilder
 from mlcache.features import PairFeatureBuilder, PairFeatures
 from mlcache.feedback.judges import SemanticReuseJudge
 from mlcache.feedback.store import JudgedPairExample, SplitJudgeTrainingStore
 from mlcache.feedback.types import JudgeDecision, JudgeLabel, JudgeRequest
 from mlcache.retrieval import VectorSearchResult
-from mlcache.semantic_types import CacheLookup, OracleDecision
+from mlcache.semantic_types import CacheKey, CacheLookup, OracleDecision
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,11 +81,17 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         judge: SemanticReuseJudge,
         store: SplitJudgeTrainingStore,
         config: ShadowCollectionConfig | None = None,
+        query_record_builder: QueryCalibrationRecordBuilder | None = None,
+        query_record_store: QueryCalibrationRecordStore | None = None,
+        record_query_calibration: bool = False,
     ) -> None:
         self.feature_builder = feature_builder
         self.judge = judge
         self.store = store
         self.config = config or ShadowCollectionConfig()
+        self.query_record_builder = query_record_builder
+        self.query_record_store = query_record_store
+        self.record_query_calibration = bool(record_query_calibration)
         self._validate_config()
         self._lock = RLock()
         self._pairs_observed = 0
@@ -124,6 +132,7 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
             "failures": 0,
         }
         seen_candidate_keys: set[str] = set()
+        candidate_labels: dict[CacheKey, int | None] = {}
         max_pairs = self.config.max_pairs_per_request
         selected = tuple(candidates)[: self.config.top_k]
 
@@ -161,6 +170,7 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
                 continue
 
             label = judge_result.decision.label
+            candidate_labels[candidate.cache_key] = self._label_to_int(label)
             if label == JudgeLabel.UNCERTAIN:
                 local["uncertain"] += 1
                 if self.config.collect_uncertain:
@@ -197,6 +207,14 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
                 local["h1_added"] += 1
             else:
                 local["h0_added"] += 1
+
+        if not self._maybe_store_query_record(
+            request=request,
+            candidates=selected,
+            served_decision=served_decision,
+            candidate_labels=candidate_labels,
+        ):
+            local["failures"] += 1
 
         self._commit_local_counts(local)
         return ShadowCollectionResult(
@@ -253,6 +271,56 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         if not is_served and not self.config.include_unserved_candidates:
             return True
         return False
+
+    def _maybe_store_query_record(
+        self,
+        *,
+        request: CacheLookup,
+        candidates: tuple[VectorSearchResult, ...],
+        served_decision: OracleDecision,
+        candidate_labels: dict[CacheKey, int | None],
+    ) -> bool:
+        if not self.record_query_calibration:
+            return True
+        if self.query_record_builder is None or self.query_record_store is None:
+            return True
+        try:
+            record = self.query_record_builder.build_record(
+                query_id=self._query_id(request),
+                request=request,
+                candidates=candidates,
+                candidate_labels=candidate_labels,
+                metadata={
+                    "source": "shadow_top_k",
+                    "served_decision_status": served_decision.status.value,
+                    "served_decision_accepted": bool(served_decision.accepted),
+                    "candidate_count": len(candidates),
+                    "top_k": self.config.top_k,
+                },
+            )
+            self.query_record_store.add(record)
+            return True
+        except Exception:
+            if self.config.raise_on_failure:
+                raise
+            return False
+
+    @staticmethod
+    def _query_id(request: CacheLookup) -> str:
+        attributes = request.metadata.attributes
+        query_id = attributes.get("query_id") or attributes.get("request_id")
+        if query_id:
+            return str(query_id)
+        query = str(request.query).strip()
+        return query if query else "anonymous_query"
+
+    @staticmethod
+    def _label_to_int(label: JudgeLabel) -> int | None:
+        if label == JudgeLabel.REUSABLE:
+            return 1
+        if label == JudgeLabel.NOT_REUSABLE:
+            return 0
+        return None
 
     @staticmethod
     def _is_self_pair(request: CacheLookup, candidate: VectorSearchResult) -> bool:
