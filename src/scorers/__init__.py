@@ -1,21 +1,5 @@
-"""Semantic scorer interfaces and implementations."""
+"""Compatibility wrapper for the old scorers package."""
 
-from scorers.base import BaseScorer, ScorerRegistry, SemanticScorer
-from scorers.cosine import CosineScorer
-from scorers.ensemble import EnsembleScorer
-from scorers.lda import LDAScorer
-from scorers.pca_whitened_cosine import PCAWhitenedCosineScorer
-from scorers.tiny_mlp import TinyMLPScorer
-from scorers.xgboost import XGBoostScorer
+from mlcache.scorers import *  # noqa: F401,F403
+from mlcache.scorers import __all__  # noqa: F401
 
-__all__ = [
-    "BaseScorer",
-    "CosineScorer",
-    "EnsembleScorer",
-    "LDAScorer",
-    "PCAWhitenedCosineScorer",
-    "ScorerRegistry",
-    "SemanticScorer",
-    "TinyMLPScorer",
-    "XGBoostScorer",
-]

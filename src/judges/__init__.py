@@ -1,29 +1,5 @@
-"""Semantic reuse judge interfaces."""
+"""Compatibility wrapper for the old judges package."""
 
-from judges.base import SemanticReuseJudge
-from judges.store import (
-    FIFOTrainingExampleEvictionPolicy,
-    InMemoryJudgeTrainingStore,
-    JudgedPairExample,
-    JudgeTrainingStore,
-    TrainingExampleEvictionPolicy,
-)
-from judges.types import (
-    JudgeDecision,
-    JudgeLabel,
-    JudgeRequest,
-    JudgeResult,
-)
+from mlcache.feedback import *  # noqa: F401,F403
+from mlcache.feedback import __all__  # noqa: F401
 
-__all__ = [
-    "JudgeDecision",
-    "JudgeLabel",
-    "JudgeRequest",
-    "JudgeResult",
-    "JudgedPairExample",
-    "JudgeTrainingStore",
-    "FIFOTrainingExampleEvictionPolicy",
-    "InMemoryJudgeTrainingStore",
-    "SemanticReuseJudge",
-    "TrainingExampleEvictionPolicy",
-]

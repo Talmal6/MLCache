@@ -1,20 +1,5 @@
-"""Online update and stopping properties."""
+"""Compatibility wrapper for the old online_properties package."""
 
-from online_properties.stopping import (
-    OnlineStoppingConfig,
-    OnlineStoppingController,
-    WindowedOnlineStoppingController,
-)
-from online_properties.types import FeedbackEvent, OnlineBatch, OnlineMetrics, StopStatus
-from online_properties.updater import OnlineUpdater
+from mlcache.online import *  # noqa: F401,F403
+from mlcache.online import __all__  # noqa: F401
 
-__all__ = [
-    "FeedbackEvent",
-    "OnlineBatch",
-    "OnlineMetrics",
-    "OnlineStoppingConfig",
-    "OnlineStoppingController",
-    "OnlineUpdater",
-    "StopStatus",
-    "WindowedOnlineStoppingController",
-]
