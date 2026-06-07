@@ -67,6 +67,14 @@ from mlcache.policies import (
     RefitPolicyDecision,
 )
 from mlcache.retrieval import VectorSearchResult, VectorStore
+from mlcache.runtime import (
+    MLCacheRuntime,
+    MLCacheRuntimeConfig,
+    RuntimeRefitConfig,
+    SemanticCacheRuntime,
+    ShadowRuntimeConfig,
+    build_mlcache_runtime,
+)
 from mlcache.scorers import (
     CosineScorer,
     EnsembleScorer,
@@ -134,6 +142,8 @@ __all__ = [
     "LearnedDirectPolicy",
     "LearnedVetoPolicy",
     "MetricsSink",
+    "MLCacheRuntime",
+    "MLCacheRuntimeConfig",
     "NormalizedHadamardFeatureBuilder",
     "NPThresholdCalibrator",
     "OnlineBatch",
@@ -163,15 +173,18 @@ __all__ = [
     "RefitPolicyContext",
     "RefitPolicyDecision",
     "Response",
+    "RuntimeRefitConfig",
     "Score",
     "ScorerName",
     "ScorerRegistry",
+    "SemanticCacheRuntime",
     "SemanticCacheGateway",
     "SemanticCacheOracle",
     "SemanticReuseJudge",
     "ShadowCollectionConfig",
     "ShadowCollectionResult",
     "ShadowCollectorSnapshot",
+    "ShadowRuntimeConfig",
     "SemanticScorer",
     "ShadowTopKCollector",
     "SplitJudgeTrainingStore",
@@ -189,5 +202,6 @@ __all__ = [
     "VectorStore",
     "WindowedOnlineStoppingController",
     "XGBoostScorer",
+    "build_mlcache_runtime",
     "wilson_upper_bound",
 ]
