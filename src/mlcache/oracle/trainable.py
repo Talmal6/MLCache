@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from threading import RLock, Thread
 from typing import Any
 
@@ -13,6 +14,8 @@ from mlcache.feedback import (
     JudgedPairExample,
     JudgeTrainingStore,
     SemanticReuseJudge,
+    ShadowTopKCollector,
+    SplitJudgeTrainingStore,
 )
 from mlcache.online import OnlineBatch, OnlineUpdater, StopStatus
 from mlcache.oracle.base import SemanticCacheOracle
@@ -41,6 +44,17 @@ from mlcache.semantic_types import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _RefitRows:
+    h0_rows: tuple[tuple[float, ...], ...]
+    h1_rows: tuple[tuple[float, ...], ...]
+    h0_train: tuple[tuple[float, ...], ...] = ()
+    h1_train: tuple[tuple[float, ...], ...] = ()
+    h0_calibration: tuple[tuple[float, ...], ...] = ()
+    h1_calibration: tuple[tuple[float, ...], ...] = ()
+    explicit_split: bool = False
+
+
 class TrainableSemanticCacheOracle(SemanticCacheOracle):
     """Trainable oracle that owns scorer fitting, NP thresholding, and candidate decisions."""
 
@@ -54,6 +68,8 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         online_updater: OnlineUpdater | None = None,
         judge: SemanticReuseJudge | None = None,
         judge_training_store: JudgeTrainingStore | None = None,
+        shadow_collector: ShadowTopKCollector | None = None,
+        shadow_collection_enabled: bool = False,
         refit_policy: RefitPolicy | None = None,
         auto_refit: bool = True,
         judge_for_feedback: bool = True,
@@ -80,6 +96,8 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         self.online_updater = online_updater
         self.judge = judge
         self.judge_training_store = judge_training_store
+        self.shadow_collector = shadow_collector
+        self.shadow_collection_enabled = bool(shadow_collection_enabled)
         self.refit_policy = refit_policy or ConservativeRefitPolicy()
         self.auto_refit = bool(auto_refit)
         self.judge_for_feedback = bool(judge_for_feedback)
@@ -133,6 +151,9 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
     def decide(self, request: CacheLookup) -> OracleDecision:
         # TODO: This currently implements pair-level direct threshold serving.
         # Production default should eventually be fallback-first with a query-level calibrated policy.
+        if self.shadow_collection_enabled and self.shadow_collector is not None:
+            return self._decide_with_shadow_collection(request)
+
         snapshot = self._snapshot_runtime_state(request)
         scored = self._score_request_with_snapshot(request, snapshot)
         feedback = self._maybe_collect_judge_feedback(
@@ -150,6 +171,31 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             feedback=feedback,
             refit_decision=refit_decision,
         )
+
+    def _decide_with_shadow_collection(self, request: CacheLookup) -> OracleDecision:
+        snapshot = self._snapshot_runtime_state(request)
+        scored = self._score_request_with_snapshot(request, snapshot)
+        feedback = self._maybe_collect_judge_feedback(
+            request=request,
+            scored=scored,
+            snapshot=snapshot,
+        )
+        serving_decision = self._finalize_decision(
+            scorer_decision=scored.decision,
+            feedback=feedback,
+            refit_decision=None,
+        )
+        self._maybe_collect_shadow_feedback(
+            request=request,
+            candidates=scored.candidates,
+            served_decision=serving_decision,
+        )
+        self._apply_feedback_and_maybe_maintain(
+            feedback=feedback,
+            scorer_decision=scored.decision,
+            snapshot=snapshot,
+        )
+        return serving_decision
 
     def _snapshot_runtime_state(self, request: CacheLookup) -> OracleRuntimeSnapshot:
         top_k = self._resolve_top_k(request)
@@ -225,6 +271,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                     reason="semantic_hits_disabled",
                     evidence={"candidate_key": str(feedback_candidate.cache_key)},
                 ),
+                candidates=tuple(candidates),
                 feedback_candidate=feedback_candidate,
                 feedback_candidate_rank=feedback_rank,
                 feedback_features=feedback_features,
@@ -247,6 +294,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                         "vector_score": float(feedback_candidate.score),
                     },
                 ),
+                candidates=tuple(candidates),
                 feedback_candidate=feedback_candidate,
                 feedback_candidate_rank=feedback_rank,
                 feedback_features=feedback_features,
@@ -296,6 +344,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                     reason="no_candidate_passed_threshold",
                     evidence={"candidates": scored},
                 ),
+                candidates=tuple(candidates),
                 feedback_candidate=feedback_candidate,
                 feedback_candidate_rank=feedback_rank,
                 feedback_features=feedback_features,
@@ -314,6 +363,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 accepted_candidate_rank=best_rank,
                 evidence={"candidates": scored},
             ),
+            candidates=tuple(candidates),
             feedback_candidate=best_candidate,
             feedback_candidate_rank=best_rank,
             feedback_features=best_features,
@@ -452,15 +502,14 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             return None
 
         try:
-            h0_rows = self._feature_rows(self.judge_training_store.h0())
-            h1_rows = self._feature_rows(self.judge_training_store.h1())
+            refit_rows = self._refit_rows_from_training_store(self.judge_training_store)
             with self._fit_lock:
                 monitor_fpr = self._monitor_fpr_locked()
                 monitor_tpr = self._monitor_tpr_locked()
                 monitor_fpr_upper_bound = self._monitor_fpr_upper_bound_locked()
                 context = RefitPolicyContext(
-                    total_h0=len(h0_rows),
-                    total_h1=len(h1_rows),
+                    total_h0=len(refit_rows.h0_rows),
+                    total_h1=len(refit_rows.h1_rows),
                     target_false_accept_rate=self.target_false_accept_rate,
                     current_threshold=current_threshold,
                     new_h0_since_fit=self._new_h0_since_fit,
@@ -477,7 +526,7 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 )
 
             decision = self.refit_policy.decide(context)
-            return self._execute_refit_decision(decision, h0_rows=h0_rows, h1_rows=h1_rows)
+            return self._execute_refit_decision(decision, refit_rows=refit_rows)
         except Exception as exc:
             failed = RefitPolicyDecision(
                 action=RefitAction.NOOP,
@@ -492,17 +541,19 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         self,
         decision: RefitPolicyDecision,
         *,
-        h0_rows: tuple[tuple[float, ...], ...],
-        h1_rows: tuple[tuple[float, ...], ...],
+        refit_rows: _RefitRows,
     ) -> RefitPolicyDecision:
         with self._fit_lock:
             self._last_refit_decision = decision
 
         if decision.action == RefitAction.RECALIBRATE_THRESHOLD:
-            if len(h0_rows) > self.sync_recalibration_max_h0:
-                self._start_recalibration_async(h0_rows, metadata=decision.metadata)
+            h0_recalibration_rows = (
+                refit_rows.h0_calibration if refit_rows.explicit_split else refit_rows.h0_rows
+            )
+            if len(h0_recalibration_rows) > self.sync_recalibration_max_h0:
+                self._start_recalibration_async(h0_recalibration_rows, metadata=decision.metadata)
                 return decision
-            threshold = self._recalibrate_threshold_from_rows(h0_rows, metadata=decision.metadata)
+            threshold = self._recalibrate_threshold_from_rows(h0_recalibration_rows, metadata=decision.metadata)
             if threshold is not None:
                 return decision
             skipped = RefitPolicyDecision(
@@ -515,7 +566,14 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             return skipped
 
         if decision.action == RefitAction.REFIT_SCORER:
-            split = self._build_refit_split(h0_rows, h1_rows, metadata=decision.metadata)
+            if refit_rows.explicit_split:
+                split = self._build_explicit_refit_split(refit_rows, metadata=decision.metadata)
+            else:
+                split = self._build_refit_split(
+                    refit_rows.h0_rows,
+                    refit_rows.h1_rows,
+                    metadata=decision.metadata,
+                )
             if split is None:
                 skipped = RefitPolicyDecision(
                     action=RefitAction.NOOP,
@@ -534,6 +592,27 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 self._threshold_version += 1
 
         return decision
+
+    def _refit_rows_from_training_store(self, store: JudgeTrainingStore) -> _RefitRows:
+        if isinstance(store, SplitJudgeTrainingStore):
+            h0_train = self._feature_rows(store.h0_train())
+            h1_train = self._feature_rows(store.h1_train())
+            h0_calibration = self._feature_rows(store.h0_calibration())
+            h1_calibration = self._feature_rows(store.h1_calibration())
+            return _RefitRows(
+                h0_rows=h0_train + h0_calibration,
+                h1_rows=h1_train + h1_calibration,
+                h0_train=h0_train,
+                h1_train=h1_train,
+                h0_calibration=h0_calibration,
+                h1_calibration=h1_calibration,
+                explicit_split=True,
+            )
+
+        return _RefitRows(
+            h0_rows=self._feature_rows(store.h0()),
+            h1_rows=self._feature_rows(store.h1()),
+        )
 
     def _start_recalibration_async(
         self,
@@ -648,6 +727,31 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             },
         )
 
+    def _build_explicit_refit_split(
+        self,
+        refit_rows: _RefitRows,
+        *,
+        metadata: dict[str, Any],
+    ) -> TrainCalibEvalSplit | None:
+        if not refit_rows.h0_train or not refit_rows.h1_train or not refit_rows.h0_calibration:
+            return None
+
+        return TrainCalibEvalSplit(
+            h0_train=refit_rows.h0_train,
+            h1_train=refit_rows.h1_train,
+            h0_calib=refit_rows.h0_calibration,
+            h1_calib=refit_rows.h1_calibration,
+            h0_eval=(),
+            h1_eval=(),
+            metadata={
+                **metadata,
+                "source": "decide_auto_refit",
+                "split_source": "split_judge_training_store",
+                "n_h0_total": len(refit_rows.h0_rows),
+                "n_h1_total": len(refit_rows.h1_rows),
+            },
+        )
+
     @staticmethod
     def _feature_rows(examples: tuple[JudgedPairExample, ...]) -> tuple[tuple[float, ...], ...]:
         return tuple(example.features for example in examples if example.features)
@@ -744,6 +848,20 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
             scorer_decision=scored.decision,
             candidate_rank=scored.feedback_candidate_rank,
         )
+
+    def _maybe_collect_shadow_feedback(
+        self,
+        *,
+        request: CacheLookup,
+        candidates: tuple[VectorSearchResult, ...],
+        served_decision: OracleDecision,
+    ) -> None:
+        if not self.shadow_collection_enabled or self.shadow_collector is None:
+            return
+        try:
+            self.shadow_collector.collect(request, candidates, served_decision)
+        except Exception:
+            return
 
     def _apply_feedback_and_maybe_maintain(
         self,

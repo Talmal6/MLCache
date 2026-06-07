@@ -25,6 +25,7 @@ class OracleRuntimeSnapshot:
 @dataclass(frozen=True, slots=True)
 class OracleScoredResult:
     decision: OracleDecision
+    candidates: tuple[VectorSearchResult, ...] = ()
     feedback_candidate: VectorSearchResult | None = None
     feedback_candidate_rank: int | None = None
     feedback_features: PairFeatures | None = None
@@ -39,4 +40,3 @@ class OracleJudgeFeedback:
     score: Score | None
     scorer_decision: OracleDecision
     candidate_rank: int | None = None
-

@@ -14,6 +14,8 @@ from mlcache.features import NormalizedHadamardFeatureBuilder, PairFeatureBuilde
 from mlcache.feedback import (
     FIFOTrainingExampleEvictionPolicy,
     InMemoryJudgeTrainingStore,
+    InMemorySplitJudgeTrainingStore,
+    DefaultShadowTopKCollector,
     JudgeDecision,
     JudgeLabel,
     JudgeRequest,
@@ -21,7 +23,11 @@ from mlcache.feedback import (
     JudgedPairExample,
     JudgeTrainingStore,
     SemanticReuseJudge,
+    ShadowCollectionConfig,
+    ShadowCollectionResult,
+    ShadowCollectorSnapshot,
     ShadowTopKCollector,
+    SplitJudgeTrainingStore,
     TrainingExampleEvictionPolicy,
 )
 from mlcache.observability import AuditEvent, AuditLogger, DiagnosticsReporter, MetricsSink
@@ -104,6 +110,7 @@ __all__ = [
     "ConservativeRefitPolicy",
     "CosineScorer",
     "DiagnosticsReporter",
+    "DefaultShadowTopKCollector",
     "Embedding",
     "EnsembleScorer",
     "ExternalSemanticCache",
@@ -111,6 +118,7 @@ __all__ = [
     "FeedbackEvent",
     "FIFOTrainingExampleEvictionPolicy",
     "InMemoryJudgeTrainingStore",
+    "InMemorySplitJudgeTrainingStore",
     "InputSpace",
     "JudgeDecision",
     "JudgeLabel",
@@ -159,8 +167,12 @@ __all__ = [
     "SemanticCacheGateway",
     "SemanticCacheOracle",
     "SemanticReuseJudge",
+    "ShadowCollectionConfig",
+    "ShadowCollectionResult",
+    "ShadowCollectorSnapshot",
     "SemanticScorer",
     "ShadowTopKCollector",
+    "SplitJudgeTrainingStore",
     "StopStatus",
     "Threshold",
     "ThresholdCalibrationRequest",
@@ -177,4 +189,3 @@ __all__ = [
     "XGBoostScorer",
     "wilson_upper_bound",
 ]
-

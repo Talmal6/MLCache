@@ -1,5 +1,7 @@
 from cache import SemanticCacheGateway
 from features import NormalizedHadamardFeatureBuilder, PairFeatureBuilder
+from judges import DefaultShadowTopKCollector as OldDefaultShadowTopKCollector
+from judges.store import InMemorySplitJudgeTrainingStore, SplitJudgeTrainingStore
 from oracle import TrainableSemanticCacheOracle
 from thresholds import ThresholdCalibrationRequest
 from vector_store import VectorStore
@@ -7,6 +9,8 @@ from vector_store import VectorStore
 from mlcache.cache import SemanticCacheGateway as NewSemanticCacheGateway
 from mlcache.calibration import ThresholdCalibrationRequest as NewThresholdCalibrationRequest
 from mlcache.calibration import wilson_upper_bound
+from mlcache.feedback import DefaultShadowTopKCollector, InMemorySplitJudgeTrainingStore as NewSplitStore
+from mlcache.feedback import SplitJudgeTrainingStore as NewSplitJudgeTrainingStore
 from mlcache.features import NormalizedHadamardFeatureBuilder as NewNormalizedHadamardFeatureBuilder
 from mlcache.oracle import TrainableSemanticCacheOracle as NewTrainableSemanticCacheOracle
 from mlcache.retrieval import VectorStore as NewVectorStore
@@ -22,6 +26,9 @@ class ImportTests(unittest.TestCase):
         self.assertIs(NormalizedHadamardFeatureBuilder, NewNormalizedHadamardFeatureBuilder)
         self.assertIs(ThresholdCalibrationRequest, NewThresholdCalibrationRequest)
         self.assertIs(VectorStore, NewVectorStore)
+        self.assertIs(InMemorySplitJudgeTrainingStore, NewSplitStore)
+        self.assertIs(SplitJudgeTrainingStore, NewSplitJudgeTrainingStore)
+        self.assertIs(OldDefaultShadowTopKCollector, DefaultShadowTopKCollector)
         self.assertTrue(issubclass(NormalizedHadamardFeatureBuilder, PairFeatureBuilder))
 
     def test_new_imports_are_available(self) -> None:
@@ -30,6 +37,8 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(NewNormalizedHadamardFeatureBuilder.__name__, "NormalizedHadamardFeatureBuilder")
         self.assertEqual(NewThresholdCalibrationRequest.__name__, "ThresholdCalibrationRequest")
         self.assertEqual(NewVectorStore.__name__, "VectorStore")
+        self.assertEqual(DefaultShadowTopKCollector.__name__, "DefaultShadowTopKCollector")
+        self.assertEqual(NewSplitStore.__name__, "InMemorySplitJudgeTrainingStore")
         self.assertTrue(callable(wilson_upper_bound))
 
 
