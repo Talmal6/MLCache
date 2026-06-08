@@ -41,6 +41,7 @@ class ShadowCollectionResult:
     uncertain: int
     skipped: int
     failures: int
+    served_candidate_label: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -234,6 +235,10 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         ):
             local["failures"] += 1
 
+        served_candidate_label = (
+            candidate_labels.get(served_decision.cache_key) if served_decision.cache_key is not None else None
+        )
+
         self._commit_local_counts(local)
         return ShadowCollectionResult(
             pairs_observed=local["pairs_observed"],
@@ -243,6 +248,7 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
             uncertain=local["uncertain"],
             skipped=local["skipped"],
             failures=local["failures"],
+            served_candidate_label=served_candidate_label,
             metadata={
                 "enabled": True,
                 "candidate_count": len(selected),

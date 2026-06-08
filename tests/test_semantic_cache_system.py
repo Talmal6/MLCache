@@ -221,6 +221,69 @@ class EnsembleLifecycleTests(unittest.TestCase):
             self.assertGreater(report["cache_hits"], 0)
             self.assertEqual(report["requests"], len(prompts))
 
+    def test_ensemble_starts_untrained_and_serves_no_semantic_hits_until_calibrated(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scs-ensemble-cold-") as tmp:
+            system = _build_system(tmp)
+
+            self.assertFalse(system.policy.calibrated)
+            self.assertFalse(system.policy.trained)
+            self.assertIsNone(system.policy.threshold)
+
+            # The real invariant is "an uncalibrated policy never serves a
+            # semantic HIT" -- not "calibration never happens before the
+            # first HIT". A freshly-calibrated policy can still legitimately
+            # MISS (e.g. a query with no close match), so asserting
+            # `not calibrated` on every pre-HIT response would conflate
+            # "calibrated" with "would always HIT". Instead: while
+            # uncalibrated, every response must come from the LLM; once a
+            # HIT occurs, the serving policy must be calibrated.
+            saw_uncalibrated_request = False
+            for prompt in _topic_prompts(60):
+                response = system.handle(prompt)
+                if not response.policy.calibrated:
+                    saw_uncalibrated_request = True
+                    self.assertEqual(
+                        response.source, "llm", "an uncalibrated policy must never serve a semantic HIT"
+                    )
+                elif response.source == "cache":
+                    break
+            self.assertTrue(saw_uncalibrated_request, "the cold-start window must include uncalibrated requests")
+
+    def test_later_batches_retrain_on_accumulated_pairs_and_increment_versions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scs-ensemble-retrain-") as tmp:
+            prompts = _topic_prompts(900)
+            system = _build_system(tmp, stream=prompts)
+
+            scorer_versions: list[int] = []
+            threshold_versions: list[int] = []
+            pair_totals: list[int] = []
+            store = system.cache.runtime.judge_training_store
+            for index, prompt in enumerate(prompts, start=1):
+                system.handle(prompt)
+                if index % system.batch_size == 0:
+                    system._maybe_check_stopping()
+                    policy = system.policy
+                    scorer_versions.append(policy.scorer_version)
+                    threshold_versions.append(policy.threshold_version)
+                    pair_totals.append(
+                        len(store.h0_train()) + len(store.h0_calibration())
+                        + len(store.h1_train()) + len(store.h1_calibration())
+                    )
+
+            # The judged-pair store must keep growing batch over batch — later
+            # refits train on the accumulated old+new pairs, not a reset slate.
+            self.assertGreater(pair_totals[-1], pair_totals[0], "judged pairs must accumulate across batches")
+            self.assertTrue(
+                all(later >= earlier for earlier, later in zip(pair_totals, pair_totals[1:])),
+                "the judged-pair store must never shrink between batches",
+            )
+            # Versions are monotonically non-decreasing, and each must have
+            # advanced past its cold-start value by the end of the run.
+            self.assertTrue(all(later >= earlier for earlier, later in zip(scorer_versions, scorer_versions[1:])))
+            self.assertTrue(all(later >= earlier for earlier, later in zip(threshold_versions, threshold_versions[1:])))
+            self.assertGreaterEqual(scorer_versions[-1], 2, "at least one real retrain must have occurred")
+            self.assertGreaterEqual(threshold_versions[-1], 1, "at least one recalibration must have occurred")
+
     def test_active_scorer_is_read_from_the_oracle_not_the_stale_cache_facade(self) -> None:
         """`cache.scorer` is fixed at construction; the oracle swaps `oracle.scorer`
         atomically on retrain. `policy.scorer` must always reflect the live one."""
@@ -239,6 +302,70 @@ class EnsembleLifecycleTests(unittest.TestCase):
 
 class CosineLifecycleTests(unittest.TestCase):
     """Spec: cosine uses the same online lifecycle, except `fit(...)` is a no-op."""
+
+    def test_cosine_starts_uncalibrated_with_semantic_hits_disabled(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scs-cosine-cold-") as tmp:
+            system = _build_system(tmp, scorer="cosine", scorers=None)
+
+            self.assertFalse(system.policy.calibrated)
+            self.assertFalse(system.policy.trained)
+            self.assertIsNone(system.policy.threshold)
+
+            responses = [system.handle(prompt) for prompt in _topic_prompts(15)]
+            self.assertTrue(
+                all(response.source == "llm" for response in responses),
+                "an uncalibrated cosine policy must never serve a semantic HIT",
+            )
+
+    def test_cosine_judged_pairs_accumulate_and_calibrate_without_training_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scs-cosine-pairs-") as tmp:
+            prompts = _topic_prompts(400)
+            system = _build_system(tmp, stream=prompts, scorer="cosine", scorers=None)
+
+            for index, prompt in enumerate(prompts, start=1):
+                system.handle(prompt)
+                if index % system.batch_size == 0:
+                    system._maybe_check_stopping()
+
+            store = system.cache.runtime.judge_training_store
+            total_h0 = len(store.h0_train()) + len(store.h0_calibration())
+            total_h1 = len(store.h1_train()) + len(store.h1_calibration())
+            self.assertGreater(total_h0, 0, "cosine lifecycle should still accumulate H0 pairs via shadow judging")
+            self.assertGreater(total_h1, 0, "cosine lifecycle should still accumulate H1 pairs via shadow judging")
+
+            policy = system.policy
+            # `fit` is a literal no-op for cosine — calibration must succeed
+            # on the strength of the unlearned scorer alone, with no fit
+            # exception ever surfacing from the oracle.
+            self.assertIsNone(system.cache.runtime.oracle._fit_exception)
+            self.assertTrue(policy.calibrated)
+            self.assertTrue(policy.trained)
+            self.assertIsNotNone(policy.threshold)
+            self.assertTrue(np.isfinite(policy.threshold))
+
+    def test_cosine_freeze_prevents_further_threshold_updates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scs-cosine-freeze-") as tmp:
+            prompts = _topic_prompts(400)
+            system = _build_system(tmp, stream=prompts, scorer="cosine", scorers=None)
+            for index, prompt in enumerate(prompts, start=1):
+                system.handle(prompt)
+                if index % system.batch_size == 0:
+                    system._maybe_check_stopping()
+
+            self.assertTrue(system.policy.calibrated, "fixture must reach a calibrated cosine policy before freezing")
+            before = system.report()
+
+            system.freeze(reason="cosine-manual-test")
+            self.assertTrue(system.frozen)
+
+            for prompt in _topic_prompts(120):
+                system.handle(prompt)
+
+            after = system.report()
+            self.assertEqual(before["threshold_version"], after["threshold_version"])
+            self.assertEqual(before["threshold"], after["threshold"])
+            self.assertEqual(before["scorer_version"], after["scorer_version"])
+            self.assertTrue(after["frozen"])
 
     def test_cosine_never_swaps_identity_but_still_calibrates_and_serves(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scs-cosine-lifecycle-") as tmp:
@@ -439,6 +566,281 @@ class ParallelismTests(unittest.TestCase):
             f"concurrent judge dispatch ({call_count} calls @ {judge_latency}s) should beat "
             f"the fully-sequential bound of {sequential_bound:.2f}s (got {elapsed:.2f}s)",
         )
+
+
+class RobustnessTests(unittest.TestCase):
+    """Spec: serving must survive judge/training failures and background retraining
+    without ever corrupting or replacing the active policy with a broken one."""
+
+    def test_serving_continues_on_old_policy_while_retraining_in_background(self) -> None:
+        gate = threading.Event()
+
+        class GatedFitScorer(CosineScorer):
+            """Cosine scorer whose `fit` blocks until the test releases `gate`.
+
+            This pins down the exact moment a background refit is "in
+            progress" so the test can deterministically observe that serving
+            keeps using the pre-refit policy snapshot throughout."""
+
+            def __init__(self, *, fit_gate: threading.Event) -> None:
+                super().__init__()
+                self._fit_gate = fit_gate
+
+            def fit(self, batch, **kwargs):  # type: ignore[override]
+                self._fit_gate.wait(timeout=10.0)
+                return super().fit(batch, **kwargs)
+
+            def copy_for_refit(self) -> "GatedFitScorer":
+                return GatedFitScorer(fit_gate=self._fit_gate)
+
+        with tempfile.TemporaryDirectory(prefix="scs-bg-retrain-") as tmp:
+            prompts = _topic_prompts(400)
+            system = _build_system(
+                tmp,
+                stream=prompts,
+                scorer=GatedFitScorer(fit_gate=gate),
+                scorers=None,
+            )
+            oracle = system.cache.runtime.oracle
+
+            fit_started = False
+            policy_before_fit: object | None = None
+            served_during_fit: list[object] = []
+            for index, prompt in enumerate(prompts, start=1):
+                response = system.handle(prompt)
+                if not fit_started and oracle.fit_in_progress:
+                    fit_started = True
+                    policy_before_fit = system.policy
+                if fit_started and not gate.is_set():
+                    served_during_fit.append(response)
+                    if len(served_during_fit) >= 3:
+                        gate.set()
+                if index % system.batch_size == 0:
+                    system._maybe_check_stopping()
+
+            gate.set()  # release unconditionally so the worker thread can't hang the test
+            oracle.wait_for_fit(timeout=10.0)
+
+            self.assertTrue(fit_started, "fixture must trigger at least one background refit")
+            assert policy_before_fit is not None
+            for response in served_during_fit:
+                self.assertEqual(
+                    response.policy.scorer_version,
+                    policy_before_fit.scorer_version,  # type: ignore[attr-defined]
+                    "requests served while a refit is in flight must use the pre-refit policy snapshot",
+                )
+
+    def test_failed_judge_calls_do_not_crash_serving(self) -> None:
+        call_count = 0
+        lock = threading.Lock()
+
+        class FlakyJudge(SemanticReuseJudge):
+            @property
+            def name(self) -> str:
+                return "flaky"
+
+            def judge(self, request: JudgeRequest) -> JudgeResult:
+                nonlocal call_count
+                with lock:
+                    call_count += 1
+                    failing = call_count % 3 == 0
+                if failing:
+                    raise RuntimeError("synthetic judge failure")
+                return DeterministicTopicJudge().judge(request)
+
+        with tempfile.TemporaryDirectory(prefix="scs-flaky-judge-") as tmp:
+            prompts = _topic_prompts(150)
+            system = _build_system(tmp, stream=prompts, judge=FlakyJudge())
+
+            responses = [system.handle(prompt) for prompt in prompts]
+
+            self.assertEqual(len(responses), len(prompts))
+            self.assertTrue(all(response.text for response in responses), "serving must keep returning real responses")
+            self.assertGreater(call_count, 0, "the flaky judge must actually have been invoked")
+
+    def test_failed_training_does_not_replace_the_active_policy(self) -> None:
+        class FlakyState:
+            def __init__(self) -> None:
+                self.fit_calls = 0
+                self.should_fail = False
+
+        class FlakyFitScorer(CosineScorer):
+            """Cosine scorer that fits normally until the test flips
+            `should_fail` (right after the policy first calibrates), and
+            raises on every fit attempted afterwards — proving a broken
+            refit can never clobber the previously-active, working policy.
+
+            Early fit attempts routinely fail the activation gate while
+            judged pairs are still accumulating (not because fitting itself
+            errors), and the oracle just keeps retrying with more data, so
+            "first fit succeeds" is not the same as "first fit activates a
+            policy" — the flakiness must be keyed off actual calibration,
+            not call count.
+            """
+
+            def __init__(self, *, state: FlakyState) -> None:
+                super().__init__()
+                self._state = state
+
+            def fit(self, batch, **kwargs):  # type: ignore[override]
+                self._state.fit_calls += 1
+                if self._state.should_fail:
+                    raise RuntimeError("synthetic fit failure")
+                return super().fit(batch, **kwargs)
+
+            def copy_for_refit(self) -> "FlakyFitScorer":
+                return FlakyFitScorer(state=self._state)
+
+        with tempfile.TemporaryDirectory(prefix="scs-flaky-fit-") as tmp:
+            prompts = _topic_prompts(700)
+            state = FlakyState()
+            system = _build_system(tmp, stream=prompts, scorer=FlakyFitScorer(state=state), scorers=None)
+            oracle = system.cache.runtime.oracle
+
+            calibrated_threshold: float | None = None
+            calibrated_scorer_version: int | None = None
+            for index, prompt in enumerate(prompts, start=1):
+                response = system.handle(prompt)
+                if calibrated_threshold is None and response.policy.calibrated:
+                    calibrated_threshold = response.policy.threshold
+                    calibrated_scorer_version = response.policy.scorer_version
+                    # From here on, every refit attempt must fail -- proving
+                    # the active policy stays untouched by broken retrains.
+                    state.should_fail = True
+                if index % system.batch_size == 0:
+                    system._maybe_check_stopping()
+
+            # Drain any in-flight background fit (it may raise -- that's the
+            # synthetic failure under test, and `decide()` already handles it
+            # without disturbing the active policy; here we just don't want a
+            # daemon thread outliving the test).
+            deadline = time.monotonic() + 5.0
+            while oracle.fit_in_progress and time.monotonic() < deadline:
+                time.sleep(0.05)
+            try:
+                oracle.wait_for_fit(timeout=0.0)
+            except BaseException:
+                pass
+
+            self.assertIsNotNone(calibrated_threshold, "the first (successful) fit must calibrate the policy")
+            self.assertGreater(state.fit_calls, 1, "the fixture must have attempted at least one more (failing) fit")
+
+            policy = system.policy
+            # A failed refit must leave the previously-active scorer/threshold
+            # serving — never an unfit, broken, or half-swapped instance.
+            self.assertTrue(policy.calibrated)
+            self.assertIsNotNone(policy.threshold)
+            self.assertTrue(np.isfinite(policy.threshold))
+            self.assertEqual(policy.threshold, calibrated_threshold)
+            self.assertEqual(policy.scorer_version, calibrated_scorer_version)
+
+            # And serving must keep working normally throughout.
+            responses = [system.handle(prompt) for prompt in _topic_prompts(30)]
+            self.assertTrue(all(response.text for response in responses))
+            self.assertTrue(any(response.source == "cache" for response in responses))
+
+
+class OfflineCalibrationTests(unittest.TestCase):
+    """Direct unit coverage for `MLCache.prefit_and_calibrate`, the offline
+    cold-start counterpart of the online lifecycle (used by experiments that
+    replay labeled datasets instead of running a live judge)."""
+
+    @staticmethod
+    def _judged_pairs(provider: TopicEmbeddingProvider, *, count: int = 200, topics: int = 6) -> list:
+        from mlcache import JudgedPairExample
+        from mlcache.features import NormalizedHadamardFeatureBuilder
+
+        feature_builder = NormalizedHadamardFeatureBuilder()
+        prompts = _topic_prompts(count, topics=topics)
+        embeddings = [provider.embed(prompt) for prompt in prompts]
+
+        pairs = []
+        judge = DeterministicTopicJudge()
+        for i, query_prompt in enumerate(prompts):
+            # Pair each query with two synthetic "candidates": one `topics`
+            # positions back (guaranteed same topic -> H1) and its immediate
+            # neighbor (a different topic, since consecutive prompts cycle
+            # through distinct `#topic` ids -> H0). This gives both labels
+            # solid representation without depending on chance.
+            candidate_indices = {(i + 1) % len(prompts)}
+            if i >= topics:
+                candidate_indices.add(i - topics)
+            for j in candidate_indices:
+                candidate_prompt = prompts[j]
+                features = feature_builder.build(embeddings[i], embeddings[j])
+                request = JudgeRequest(query=query_prompt, candidate_query=candidate_prompt)
+                judge_result = judge.judge(request)
+                pairs.append(
+                    JudgedPairExample(
+                        features=tuple(float(value) for value in features.hadamard),
+                        request=request,
+                        decision=judge_result.decision,
+                    )
+                )
+        return pairs
+
+    def test_prefit_and_calibrate_fits_trains_calibrates_and_reports(self) -> None:
+        from mlcache import MLCache
+        from mlcache.features import PairFeatures
+
+        provider = TopicEmbeddingProvider()
+        pairs = self._judged_pairs(provider)
+        n_h0 = sum(1 for pair in pairs if pair.decision.label == JudgeLabel.NOT_REUSABLE)
+        n_h1 = sum(1 for pair in pairs if pair.decision.label == JudgeLabel.REUSABLE)
+        self.assertGreater(n_h0, 0)
+        self.assertGreater(n_h1, 0)
+
+        with tempfile.TemporaryDirectory(prefix="scs-prefit-calibrate-") as tmp:
+            cache = MLCache.from_preset(
+                root_dir=tmp,
+                scorer="ensemble",
+                scorers=["cosine", "lda"],
+                top_k=3,
+                persistence=False,
+            )
+            sample_features = PairFeatures(hadamard=pairs[0].features)
+            # An unfit LDA member raises rather than scoring a degenerate
+            # value, so it can't be scored *before* `prefit_and_calibrate` —
+            # which is itself the clearest proof that fitting is mandatory
+            # and must have actually happened for scoring to succeed below.
+            with self.assertRaises(ValueError):
+                cache.scorer.score(sample_features)
+
+            report = cache.prefit_and_calibrate(pairs, target_fpr=0.2, fit_kwargs={"alpha": 0.05, "seed": 7})
+
+            # `prefit` fits the scorer (and its trainable ensemble members) in
+            # place -- no instance swap, that's the oracle's online-refit job,
+            # not the offline cold-start path's. Scoring now succeeding is
+            # direct proof the trainable member was actually fit.
+            score_after_fit = cache.scorer.score(sample_features)
+            self.assertTrue(np.isfinite(float(score_after_fit)))
+
+            # The threshold must be finite and active on the runtime.
+            self.assertIsNotNone(cache.runtime.oracle._threshold)
+            self.assertTrue(np.isfinite(float(cache.runtime.oracle._threshold)))
+            self.assertEqual(float(cache.runtime.oracle._threshold), float(report["threshold"]))
+
+            self.assertEqual(set(report.keys()), {"scorer", "threshold", "target_fpr", "n_h0", "n_h1"})
+            self.assertEqual(report["scorer"], cache.scorer.name)
+            self.assertTrue(np.isfinite(report["threshold"]))
+            self.assertEqual(report["target_fpr"], 0.2)
+            self.assertEqual(report["n_h0"], n_h0)
+            self.assertEqual(report["n_h1"], n_h1)
+
+    def test_prefit_and_calibrate_calibrates_cosine_without_fitting(self) -> None:
+        from mlcache import MLCache
+
+        provider = TopicEmbeddingProvider()
+        pairs = self._judged_pairs(provider)
+
+        with tempfile.TemporaryDirectory(prefix="scs-prefit-calibrate-cosine-") as tmp:
+            cache = MLCache.from_preset(root_dir=tmp, scorer="cosine", top_k=3, persistence=False)
+
+            report = cache.prefit_and_calibrate(pairs, target_fpr=0.2)
+
+            self.assertEqual(report["scorer"], cache.scorer.name)
+            self.assertTrue(np.isfinite(report["threshold"]))
+            self.assertTrue(np.isfinite(float(cache.runtime.oracle._threshold)))
 
 
 class EndToEndConstructionTests(unittest.TestCase):

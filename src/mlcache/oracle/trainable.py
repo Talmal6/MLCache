@@ -15,6 +15,7 @@ from mlcache.feedback import (
     JudgedPairExample,
     JudgeTrainingStore,
     SemanticReuseJudge,
+    ShadowCollectionResult,
     ShadowTopKCollector,
     SplitJudgeTrainingStore,
 )
@@ -201,26 +202,41 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
     def _decide_with_shadow_collection(self, request: CacheLookup) -> OracleDecision:
         snapshot = self._snapshot_runtime_state(request)
         scored = self._score_request_with_snapshot(request, snapshot)
-        feedback = self._maybe_collect_judge_feedback(
-            request=request,
-            scored=scored,
-            snapshot=snapshot,
-        )
+
+        # Shadow top-k collection independently judges *every* retrieved
+        # candidate -- including ones the active policy rejected -- and is
+        # the sole source of judged-pair accumulation and refit/monitoring
+        # signal on this path, so calibration sees hard negatives from
+        # retrieved-but-rejected candidates rather than only from whichever
+        # single candidate the policy happened to serve. The legacy
+        # single-candidate judge-feedback path is only consulted when the
+        # judge is allowed to override the serving decision; even then its
+        # verdict is used solely to finalize the decision, not stored again,
+        # so the served candidate is never double-judged or double-counted.
+        feedback = None
+        if self.judge_can_override_decision:
+            feedback = self._maybe_collect_judge_feedback(
+                request=request,
+                scored=scored,
+                snapshot=snapshot,
+            )
+
         serving_decision = self._finalize_decision(
             scorer_decision=scored.decision,
             feedback=feedback,
             refit_decision=None,
         )
-        self._maybe_collect_shadow_feedback(
+        shadow_result = self._maybe_collect_shadow_feedback(
             request=request,
             candidates=scored.candidates,
             served_decision=serving_decision,
         )
-        self._apply_feedback_and_maybe_maintain(
-            feedback=feedback,
-            scorer_decision=scored.decision,
-            snapshot=snapshot,
-        )
+        if shadow_result is not None:
+            self._record_shadow_collection_for_monitoring(
+                result=shadow_result,
+                served_decision=serving_decision,
+            )
+        self._maybe_auto_refit(current_threshold=snapshot.threshold)
         return serving_decision
 
     def _snapshot_runtime_state(self, request: CacheLookup) -> OracleRuntimeSnapshot:
@@ -1014,8 +1030,16 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         scored: OracleScoredResult,
         snapshot: OracleRuntimeSnapshot,
     ) -> OracleJudgeFeedback | None:
-        # TODO: Shadow top-k collection should be independent of serving.
-        # This feedback path remains tied to the served candidate for compatibility.
+        # Single-candidate judge feedback on the served/top candidate. This is
+        # the *non*-shadow `decide()` path's only source of judged pairs and
+        # refit/monitoring signal -- intentionally tied to the served
+        # candidate, since that's the only candidate whose accept/reject
+        # outcome it can evaluate. When shadow collection is enabled,
+        # `_decide_with_shadow_collection` judges and accumulates the full
+        # top-k independently of serving (see `_record_shadow_collection_for_monitoring`)
+        # and only reaches this method when `judge_can_override_decision` needs
+        # a verdict to finalize the decision -- never to store or count it
+        # again, so the served candidate is never double-judged.
         if not self._should_call_judge() or scored.feedback_candidate is None:
             return None
 
@@ -1051,13 +1075,42 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         request: CacheLookup,
         candidates: tuple[VectorSearchResult, ...],
         served_decision: OracleDecision,
-    ) -> None:
+    ) -> ShadowCollectionResult | None:
         if not self.shadow_collection_enabled or self.shadow_collector is None:
-            return
+            return None
         try:
-            self.shadow_collector.collect(request, candidates, served_decision)
+            return self.shadow_collector.collect(request, candidates, served_decision)
         except Exception:
-            return
+            return None
+
+    def _record_shadow_collection_for_monitoring(
+        self,
+        *,
+        result: ShadowCollectionResult,
+        served_decision: OracleDecision,
+    ) -> None:
+        """Feed refit-triggering counters and online monitoring from shadow top-k judgments.
+
+        The shadow collector judges the full top-k independently of serving,
+        so its aggregate H0/H1 counts are a richer, unbiased signal for "have
+        we accumulated enough new pairs to refit/recalibrate" than any single
+        served-candidate verdict could be. Only the served candidate can ever
+        be a true/false accept (at most one candidate is served per request),
+        so its judged label -- if the shadow batch judged it -- is what drives
+        TPR/FPR monitoring.
+        """
+
+        with self._fit_lock:
+            self._new_h0_since_fit += result.h0_added
+            self._new_h1_since_fit += result.h1_added
+            self._new_h0_since_calibration += result.h0_added
+            self._monitor_h0_count += result.h0_added
+            self._monitor_h1_count += result.h1_added
+            if served_decision.accepted and result.served_candidate_label is not None:
+                if result.served_candidate_label == 1:
+                    self._monitor_true_accepts += 1
+                elif result.served_candidate_label == 0:
+                    self._monitor_false_accepts += 1
 
     def _apply_feedback_and_maybe_maintain(
         self,

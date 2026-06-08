@@ -1,0 +1,16 @@
+{
+  "format": "mlcache.file_threshold_provider.v1",
+  "records": [
+    {
+      "cluster_id": null,
+      "context": {
+        "source": "mlcache_from_preset"
+      },
+      "region_id": null,
+      "scope": "global",
+      "scorer": "Cosine",
+      "threshold": 0.05,
+      "updated_at": "2026-06-08T16:36:03.261572+00:00"
+    }
+  ]
+}

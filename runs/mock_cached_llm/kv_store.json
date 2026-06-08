@@ -1,0 +1,6 @@
+{
+  "format": "mlcache.file_kv_store.v1",
+  "responses": {
+    "mock-llm:4476aa61a8b07ee8": "mock response for: Explain semantic caching."
+  }
+}
