@@ -1,0 +1,101 @@
+{
+  "detected_schema": {
+    "available_fields": [
+      "text",
+      "label",
+      "meta",
+      "emb",
+      "emb_umap",
+      "global_cluster"
+    ],
+    "chosen_fields": {
+      "anchor_embedding_field": null,
+      "anchor_field": "global_cluster",
+      "label_field": "label",
+      "query_embedding_field": "emb",
+      "query_field": "text"
+    },
+    "embedding_dim": 1024,
+    "label_distribution": {
+      "-1": 23,
+      "0": 24,
+      "1": 3
+    },
+    "metadata": {
+      "max_rows": 50,
+      "source": "h1h0_npz"
+    },
+    "path": "C:\\Work\\MLCache\\data\\h1h0_final.npz",
+    "row_count": 50,
+    "unique_anchors": 16
+  },
+  "raw_npz_schema": {
+    "available_fields": [
+      "text",
+      "label",
+      "meta",
+      "emb",
+      "emb_umap",
+      "global_cluster"
+    ],
+    "fields": [
+      {
+        "dtype": "object",
+        "name": "text",
+        "ndim": 1,
+        "shape": [
+          200000
+        ]
+      },
+      {
+        "distribution": {
+          "-1": 102918,
+          "0": 82063,
+          "1": 15019
+        },
+        "dtype": "int32",
+        "name": "label",
+        "ndim": 1,
+        "shape": [
+          200000
+        ]
+      },
+      {
+        "dtype": "object",
+        "name": "meta",
+        "ndim": 1,
+        "shape": [
+          1
+        ]
+      },
+      {
+        "dtype": "float32",
+        "name": "emb",
+        "ndim": 2,
+        "shape": [
+          200000,
+          1024
+        ]
+      },
+      {
+        "dtype": "float32",
+        "name": "emb_umap",
+        "ndim": 2,
+        "shape": [
+          200000,
+          30
+        ]
+      },
+      {
+        "dtype": "int32",
+        "name": "global_cluster",
+        "ndim": 1,
+        "shape": [
+          200000
+        ]
+      }
+    ],
+    "path": "C:/Work/MLCache/data/h1h0_final.npz"
+  },
+  "schema_valid": true
+}

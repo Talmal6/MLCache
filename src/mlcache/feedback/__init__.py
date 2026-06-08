@@ -1,5 +1,12 @@
 """Feedback, judges, and label stores."""
 
+from mlcache.feedback.h1h0_npz_adapters import (
+    H1H0NPZDataset,
+    H1H0NPZJudgeAdapter,
+    H1H0NPZRecord,
+    H1H0NPZSchema,
+    H1H0NPZStreamAdapter,
+)
 from mlcache.feedback.judges import SemanticReuseJudge
 from mlcache.feedback.shadow_collector import (
     DefaultShadowTopKCollector,
@@ -21,6 +28,11 @@ from mlcache.feedback.types import JudgeDecision, JudgeLabel, JudgeRequest, Judg
 
 __all__ = [
     "FIFOTrainingExampleEvictionPolicy",
+    "H1H0NPZDataset",
+    "H1H0NPZJudgeAdapter",
+    "H1H0NPZRecord",
+    "H1H0NPZSchema",
+    "H1H0NPZStreamAdapter",
     "InMemoryJudgeTrainingStore",
     "InMemorySplitJudgeTrainingStore",
     "DefaultShadowTopKCollector",

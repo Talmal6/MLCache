@@ -1,0 +1,2 @@
+[console_scripts]
+mlcache-smoke = mlcache.cli:main

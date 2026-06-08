@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: semantic-desider
+Version: 0.1.0
+Summary: Correctness-controlled online semantic cache contracts and runtime boundaries.
+Requires-Python: >=3.11
+Requires-Dist: numpy>=1.23
+Provides-Extra: ml
+Requires-Dist: scikit-learn>=1.2; extra == "ml"
+Requires-Dist: xgboost>=1.7; extra == "ml"
+Provides-Extra: embeddings
+Requires-Dist: sentence-transformers>=2.7; extra == "embeddings"
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
+Provides-Extra: all
+Requires-Dist: scikit-learn>=1.2; extra == "all"
+Requires-Dist: xgboost>=1.7; extra == "all"
+Requires-Dist: pytest>=7; extra == "all"
+Requires-Dist: sentence-transformers>=2.7; extra == "all"

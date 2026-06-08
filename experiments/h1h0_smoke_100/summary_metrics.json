@@ -1,0 +1,28 @@
+{
+  "abstain_or_miss_rate": 0.0,
+  "accept_error_rate": 0.5,
+  "h0_rejection_rate": 0.0,
+  "h1_recall": 1.0,
+  "hit_rate": 1.0,
+  "n_accepts": 100,
+  "n_false_accepts": 50,
+  "n_false_rejects": 0,
+  "n_h0": 50,
+  "n_h1": 12,
+  "n_requests": 100,
+  "n_responses": 100,
+  "n_true_accepts": 12,
+  "n_true_rejects": 0,
+  "n_uncertain_accepts": 38,
+  "query_level_calibration_metadata": null,
+  "query_level_threshold": null,
+  "query_record_count": 0,
+  "runtime_activation_status": {
+    "semantic_hits_disabled": false,
+    "threshold": 0.0,
+    "threshold_version": 0
+  },
+  "shadow_snapshot": null,
+  "status": "ok",
+  "stream_error_rate": 0.5
+}

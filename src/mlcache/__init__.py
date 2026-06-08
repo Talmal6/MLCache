@@ -33,6 +33,11 @@ from mlcache.calibration import (
 from mlcache.features import NormalizedHadamardFeatureBuilder, PairFeatureBuilder, PairFeatureKind, PairFeatures
 from mlcache.feedback import (
     FIFOTrainingExampleEvictionPolicy,
+    H1H0NPZDataset,
+    H1H0NPZJudgeAdapter,
+    H1H0NPZRecord,
+    H1H0NPZSchema,
+    H1H0NPZStreamAdapter,
     InMemoryJudgeTrainingStore,
     InMemorySplitJudgeTrainingStore,
     DefaultShadowTopKCollector,
@@ -50,6 +55,7 @@ from mlcache.feedback import (
     SplitJudgeTrainingStore,
     TrainingExampleEvictionPolicy,
 )
+from mlcache.embeddings import EmbeddingProvider, SentenceTransformersEmbeddingProvider
 from mlcache.observability import AuditEvent, AuditLogger, DiagnosticsReporter, MetricsSink
 from mlcache.online import (
     FeedbackEvent,
@@ -151,6 +157,7 @@ __all__ = [
     "DiagnosticsReporter",
     "DefaultShadowTopKCollector",
     "Embedding",
+    "EmbeddingProvider",
     "EnsembleScorer",
     "ExternalSemanticCache",
     "FallbackFirstPolicy",
@@ -161,6 +168,11 @@ __all__ = [
     "FileVectorStore",
     "FeedbackEvent",
     "FIFOTrainingExampleEvictionPolicy",
+    "H1H0NPZDataset",
+    "H1H0NPZJudgeAdapter",
+    "H1H0NPZRecord",
+    "H1H0NPZSchema",
+    "H1H0NPZStreamAdapter",
     "InMemoryJudgeTrainingStore",
     "InMemoryKVStore",
     "InMemoryQueryCalibrationRecordStore",
@@ -233,6 +245,7 @@ __all__ = [
     "SemanticCacheGateway",
     "SemanticCacheOracle",
     "SemanticReuseJudge",
+    "SentenceTransformersEmbeddingProvider",
     "ShadowCollectionConfig",
     "ShadowCollectionResult",
     "ShadowCollectorSnapshot",

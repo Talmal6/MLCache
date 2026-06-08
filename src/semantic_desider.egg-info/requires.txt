@@ -1,0 +1,17 @@
+numpy>=1.23
+
+[all]
+scikit-learn>=1.2
+xgboost>=1.7
+pytest>=7
+sentence-transformers>=2.7
+
+[dev]
+pytest>=7
+
+[embeddings]
+sentence-transformers>=2.7
+
+[ml]
+scikit-learn>=1.2
+xgboost>=1.7
