@@ -186,6 +186,61 @@ class JudgedPairAccumulationTests(unittest.TestCase):
             self.assertGreater(total_h0, 0, "shadow collection should have observed NOT_REUSABLE pairs")
             self.assertGreater(total_h1, 0, "shadow collection should have observed REUSABLE pairs")
 
+    def test_shadow_pairs_from_rejected_candidates_reach_the_training_store_and_drive_calibration(self) -> None:
+        """Spec: shadow top-k judging must label *every* retrieved candidate --
+        including ones the active policy rejected (served nothing, MISS) --
+        and those judged pairs must land in the same store that feeds
+        training/calibration, not just pairs for the served/accepted candidate.
+
+        On a MISS, `served_decision.cache_key` is `None` (no candidate was
+        served), so *every* judged pair stored under a MISS decision is, by
+        construction, a retrieved-but-rejected candidate. Their presence in
+        the store -- which is the sole source of `_refit_rows_from_training_store`
+        -- is direct proof that online learning is not limited to served pairs.
+        """
+
+        with tempfile.TemporaryDirectory(prefix="scs-rejected-pairs-") as tmp:
+            prompts = _topic_prompts(360)
+            system = _build_system(tmp, stream=prompts)
+            system.run()
+
+            store = system.cache.runtime.judge_training_store
+            self.assertIsNotNone(store)
+            all_examples = (
+                store.h0_train() + store.h0_calibration() + store.h1_train() + store.h1_calibration()
+            )
+            self.assertGreater(len(all_examples), 0, "shadow collection should have stored judged pairs")
+
+            rejected_candidate_examples = [
+                example for example in all_examples if example.metadata.get("served_decision_accepted") is False
+            ]
+            self.assertGreater(
+                len(rejected_candidate_examples),
+                0,
+                "judged pairs for retrieved-but-rejected candidates (MISS decisions, "
+                "no served candidate) should be present in the training store",
+            )
+            self.assertTrue(
+                any(example.decision.label == JudgeLabel.NOT_REUSABLE for example in rejected_candidate_examples),
+                "rejected-candidate pairs should include NOT_REUSABLE (H0) labels",
+            )
+            self.assertTrue(
+                any(example.decision.label == JudgeLabel.REUSABLE for example in rejected_candidate_examples),
+                "rejected-candidate pairs should include REUSABLE (H1) labels",
+            )
+
+            # More judged pairs were stored than the system ever served from
+            # the cache -- proof that shadow judging covers candidates beyond
+            # whichever single one (if any) was served per request.
+            self.assertGreater(len(all_examples), system.report()["cache_hits"])
+
+            # These pairs are the only feedstock for training/calibration
+            # (`_refit_rows_from_training_store` reads exactly these buckets),
+            # so a system that reached a trained, calibrated policy did so by
+            # learning from them.
+            self.assertTrue(system.policy.trained)
+            self.assertTrue(system.policy.calibrated)
+
 
 class EnsembleLifecycleTests(unittest.TestCase):
     """Spec: an untrained ensemble must never make semantic HIT decisions;
