@@ -64,7 +64,7 @@ from mlcache.builder import (
     build_scorer,
 )
 from mlcache.embeddings import EmbeddingProvider, HashingEmbeddingProvider, SentenceTransformersEmbeddingProvider
-from mlcache.llm_wrapper import CachedLLM, CachedLLMResponse, LLMClient, LLMResponse, MockLLM
+from mlcache.llm_wrapper import CachedLLM, CachedLLMResponse, LLMClient, LLMJudge, LLMResponse, MockLLM
 from mlcache.observability import AuditEvent, AuditLogger, DiagnosticsReporter, MetricsSink
 from mlcache.online import (
     FeedbackEvent,
@@ -147,8 +147,10 @@ from mlcache.semantic_types import (
     TieMode,
     TrainCalibEvalSplit,
 )
+from mlcache.system import ActivePolicy, SemanticCacheSystem, SystemResponse
 
 __all__ = [
+    "ActivePolicy",
     "AuditEvent",
     "AuditLogger",
     "ActivationGateResult",
@@ -211,6 +213,7 @@ __all__ = [
     "LearnedDirectPolicy",
     "LearnedVetoPolicy",
     "LLMClient",
+    "LLMJudge",
     "LLMResponse",
     "MetricsSink",
     "MockLLM",
@@ -265,6 +268,7 @@ __all__ = [
     "SemanticCacheRuntime",
     "SemanticCacheGateway",
     "SemanticCacheOracle",
+    "SemanticCacheSystem",
     "SemanticReuseJudge",
     "SentenceTransformersEmbeddingProvider",
     "ShadowCollectionConfig",
@@ -275,6 +279,7 @@ __all__ = [
     "ShadowTopKCollector",
     "SplitJudgeTrainingStore",
     "StopStatus",
+    "SystemResponse",
     "Threshold",
     "ThresholdCalibrationRequest",
     "ThresholdProvider",

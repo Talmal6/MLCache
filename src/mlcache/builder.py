@@ -11,8 +11,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterable
 
-from mlcache.calibration import ThresholdScope
-from mlcache.feedback import SemanticReuseJudge
+from mlcache.calibration import ThresholdCalibrationRequest, ThresholdScope
+from mlcache.feedback import JudgedPairExample, JudgeLabel, SemanticReuseJudge
 from mlcache.features import NormalizedHadamardFeatureBuilder, PairFeatureBuilder
 from mlcache.runtime.config import MLCacheRuntimeConfig, RuntimeRefitConfig
 from mlcache.runtime.local import build_local_mlcache_runtime
@@ -26,6 +26,7 @@ from mlcache.scorers import (
     TinyMLPScorer,
     XGBoostScorer,
 )
+from mlcache.scorers.utils import score_rows_with_scorer
 from mlcache.semantic_types import LabeledPairBatch, Threshold
 
 ML_DEPENDENCIES_ERROR = "Install ML dependencies with: pip install -e '.[ml,dev]'"
@@ -171,6 +172,54 @@ class MLCache:
             self.scorer.fit(batch, **kwargs)
         except ImportError as exc:
             raise ImportError(ML_DEPENDENCIES_ERROR) from exc
+
+    def prefit_and_calibrate(
+        self,
+        judged_pairs: Iterable[JudgedPairExample],
+        *,
+        target_fpr: float = 0.05,
+        fit_kwargs: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        """Cold-start calibration owned by the cache: fit (if trainable) then calibrate.
+
+        This is the offline counterpart of the online lifecycle: it owns the
+        full "build labeled batch -> fit scorer -> score H0 -> pick a
+        Neyman-Pearson threshold -> activate threshold" sequence so experiments
+        never need to compute pair scores or call `scorer.calibrate(...)`
+        themselves. For trainable scorers, fitting happens before calibration;
+        for cosine, `fit` is a no-op and calibration proceeds directly on the
+        unlearned scorer.
+        """
+
+        h0_examples: list[JudgedPairExample] = []
+        h1_examples: list[JudgedPairExample] = []
+        for example in judged_pairs:
+            label = example.decision.label
+            if label == JudgeLabel.NOT_REUSABLE:
+                h0_examples.append(example)
+            elif label == JudgeLabel.REUSABLE:
+                h1_examples.append(example)
+
+        if h0_examples and h1_examples:
+            batch = LabeledPairBatch(
+                h0=[example.features for example in h0_examples],
+                h1=[example.features for example in h1_examples],
+            )
+            self.prefit(batch, **(fit_kwargs or {}))
+
+        h0_scores = score_rows_with_scorer([example.features for example in h0_examples], self.scorer)
+        threshold = self.scorer.calibrate(
+            ThresholdCalibrationRequest(h0_scores=h0_scores, target_false_accept_rate=float(target_fpr))
+        )
+        self.set_threshold(threshold)
+
+        return {
+            "scorer": self.scorer.name,
+            "threshold": float(threshold),
+            "target_fpr": float(target_fpr),
+            "n_h0": len(h0_examples),
+            "n_h1": len(h1_examples),
+        }
 
     def index(self, entries: Iterable[Any]) -> None:
         """Index cache candidates (CacheEntry instances) ahead of serving lookups."""

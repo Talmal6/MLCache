@@ -16,6 +16,13 @@ from typing import Any, Literal, Protocol
 
 from mlcache.builder import MLCache
 from mlcache.embeddings import EmbeddingProvider, HashingEmbeddingProvider
+from mlcache.feedback import (
+    JudgeDecision,
+    JudgeLabel,
+    JudgeRequest,
+    JudgeResult,
+    SemanticReuseJudge,
+)
 from mlcache.semantic_types import CacheEntry, CacheKey, CacheLookup, CacheMetadata, Query, Response
 
 
@@ -136,10 +143,65 @@ class CachedLLM:
         return CacheKey(f"{prefix}{digest}")
 
 
+class LLMJudge(SemanticReuseJudge):
+    """Adapts an `LLMClient` into a `SemanticReuseJudge`.
+
+    `LLMClient` and `SemanticReuseJudge` are deliberately separate concepts —
+    one generates responses, the other labels query/candidate pairs for reuse.
+    This adapter lets the same underlying model power both without collapsing
+    the interfaces: it prompts the wrapped LLM to label a candidate and parses
+    the reply into a `JudgeDecision`, defaulting to `UNCERTAIN` when the reply
+    is not an exact "REUSABLE"/"NOT_REUSABLE" token (e.g. `MockLLM`'s echoed
+    text, which carries no real judgment).
+    """
+
+    _PROMPT_TEMPLATE = (
+        "Decide whether the cached response below may be reused to answer the "
+        "new query. Reply with exactly one word: REUSABLE or NOT_REUSABLE.\n\n"
+        "New query: {query}\n"
+        "Cached query: {candidate_query}\n"
+        "Cached response: {candidate_response}\n"
+    )
+
+    def __init__(self, llm: LLMClient, *, name: str = "llm_judge") -> None:
+        self._llm = llm
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def judge(self, request: JudgeRequest) -> JudgeResult:
+        prompt = self._PROMPT_TEMPLATE.format(
+            query=request.query,
+            candidate_query=request.candidate_query if request.candidate_query is not None else "",
+            candidate_response=request.candidate_response if request.candidate_response is not None else "",
+        )
+        response = self._llm.generate(prompt)
+        return JudgeResult(
+            request=request,
+            decision=JudgeDecision(
+                label=self._parse_label(response.text),
+                rationale=response.text,
+                metadata={"judge": self._name},
+            ),
+        )
+
+    @staticmethod
+    def _parse_label(text: str) -> JudgeLabel:
+        normalized = text.strip().upper()
+        if normalized == "REUSABLE":
+            return JudgeLabel.REUSABLE
+        if normalized == "NOT_REUSABLE":
+            return JudgeLabel.NOT_REUSABLE
+        return JudgeLabel.UNCERTAIN
+
+
 __all__ = [
     "CachedLLM",
     "CachedLLMResponse",
     "LLMClient",
+    "LLMJudge",
     "LLMResponse",
     "MockLLM",
 ]

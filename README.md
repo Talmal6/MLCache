@@ -97,6 +97,85 @@ the cache) and the second served straight from the cache (`source="cache"`).
 Once the mock LLM flow is stable, we can add an OpenAI-compatible provider in
 a separate step.
 
+## `SemanticCacheSystem`: a self-running online semantic cache
+
+`MLCache` and `CachedLLM` are building blocks; experiments that compose them
+directly tend to re-implement pieces of the calibration/training lifecycle by
+hand (scoring pairs, calling `scorer.calibrate(...)`, setting thresholds).
+`SemanticCacheSystem` is the alternative — it owns the *entire* lifecycle
+end to end:
+
+```python
+from mlcache import MockLLM, SemanticCacheSystem
+
+system = SemanticCacheSystem(
+    llm=MockLLM(response_template="mock response for: {prompt}"),
+    stream=prompts,            # any iterable of prompt strings
+    scorer="ensemble",
+    target_fpr=0.05,
+)
+report = system.run()
+```
+
+It serves requests (embed -> retrieve -> score -> HIT/MISS -> LLM fallback ->
+write-through), and learns in the background (shadow-judges top-k candidates,
+accumulates judged H0/H1 pairs, retrains and recalibrates atomically once
+enough pairs accumulate, and activates the new scorer+threshold as a single
+versioned unit). Until a calibrated policy exists the oracle abstains, so an
+untrained scorer never serves a semantic HIT — every cold-start request is a
+genuine LLM call (`source="llm"`), written through to the cache, while the
+judge keeps labelling candidates for learning. Once calibrated, real cache
+hits (`source="cache"`) start flowing.
+
+`system.policy` returns an `ActivePolicy` — an immutable snapshot of the
+scorer, threshold, and their version numbers, plus `calibrated`, `trained`,
+and `frozen` flags — built from the oracle's atomically-swapped state so you
+never observe a scorer from one generation paired with a threshold from
+another. `system.handle(prompt)` returns a `SystemResponse` (`text`, `source`,
+`cache_key`, `score`, `threshold`, and the `policy` that served it).
+`system.report()` summarizes counts, hit rate, and policy state for the whole
+run.
+
+`freeze(reason=...)` stops further training/calibration while serving
+continues on the frozen policy — and the system can also freeze itself
+automatically once its convergence-stopping controller decides online metrics
+have stabilized (`freeze_reason="online_metrics_converged"` in the report).
+
+### `LLMJudge`: turning an `LLMClient` into a `SemanticReuseJudge`
+
+`SemanticCacheSystem` needs a `SemanticReuseJudge` to label query/candidate
+pairs as reusable or not. If you don't supply one, it synthesizes `LLMJudge`
+from the same `LLMClient` you passed in — prompting it to reply
+`REUSABLE`/`NOT_REUSABLE` for a given pair and parsing the reply into a
+`JudgeDecision` (anything else, e.g. `MockLLM`'s echoed text, becomes
+`UNCERTAIN`). `LLMClient` and `SemanticReuseJudge` stay distinct interfaces —
+one generates responses, the other labels pairs — even when the same model
+backs both:
+
+```python
+from mlcache import LLMJudge, MockLLM
+
+judge = LLMJudge(MockLLM(response_template="..."), name="my-judge")
+```
+
+### `MLCache.prefit_and_calibrate`: cold-start calibration in one call
+
+When you already have a labeled offline dataset (e.g. an H1/H0 NPZ split) and
+want to cold-start a cache without a live judge, adapt the dataset's rows into
+`JudgedPairExample`s and hand them to `cache.prefit_and_calibrate(...)`. It
+owns the whole "fit trainable scorers on H0/H1 pairs -> score H0 -> pick a
+Neyman-Pearson threshold for the target false-accept rate -> activate" sequence,
+so the caller never scores pairs or calls `scorer.calibrate(...)` directly:
+
+```python
+report = cache.prefit_and_calibrate(judged_pairs, target_fpr=0.05)
+# {"scorer": ..., "threshold": ..., "target_fpr": ..., "n_h0": ..., "n_h1": ...}
+```
+
+See `scripts/run_cold_start_tpr_fpr_experiment.py` for a full example that
+adapts `H1H0NPZRecord`s into `JudgedPairExample`s and compares two systems'
+cold-start TPR/FPR after calibrating both to the same FPR budget this way.
+
 ## Quickstart with real embeddings
 
 ```bash

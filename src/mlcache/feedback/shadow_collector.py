@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Sequence
@@ -84,10 +85,12 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         query_record_builder: QueryCalibrationRecordBuilder | None = None,
         query_record_store: QueryCalibrationRecordStore | None = None,
         record_query_calibration: bool = False,
+        judge_executor: Executor | None = None,
     ) -> None:
         self.feature_builder = feature_builder
         self.judge = judge
         self.store = store
+        self.judge_executor = judge_executor
         self.config = config or ShadowCollectionConfig()
         self.query_record_builder = query_record_builder
         self.query_record_store = query_record_store
@@ -142,6 +145,7 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         max_pairs = self.config.max_pairs_per_request
         selected = tuple(candidates)[: self.config.top_k]
 
+        prepared: list[tuple[int, VectorSearchResult, PairFeatures, JudgeRequest]] = []
         for rank, candidate in enumerate(selected, start=1):
             if max_pairs is not None and local["pairs_observed"] >= max_pairs:
                 break
@@ -165,15 +169,23 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
                 continue
 
             judge_request = self._judge_request(request, candidate, served_decision, rank)
+            prepared.append((rank, candidate, features, judge_request))
+
+        # Judge calls are independent per candidate, so when an executor is
+        # configured and failures are non-fatal (the default), they run
+        # concurrently — this is the slowest step (often an LLM round-trip)
+        # and the one most worth parallelizing across top-k candidates.
+        judge_results = self._judge_many([entry[3] for entry in prepared])
+
+        for (rank, candidate, features, judge_request), outcome in zip(prepared, judge_results):
             local["judge_calls"] += 1
-            try:
-                judge_result = self.judge.judge(judge_request)
-            except Exception:
+            if isinstance(outcome, BaseException):
                 local["failures"] += 1
                 if self.config.raise_on_failure:
                     self._commit_local_counts(local)
-                    raise
+                    raise outcome
                 continue
+            judge_result = outcome
 
             label = judge_result.decision.label
             candidate_labels[candidate.cache_key] = self._label_to_int(label)
@@ -237,6 +249,35 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
                 "top_k": self.config.top_k,
             },
         )
+
+    def _judge_many(self, requests: Sequence[JudgeRequest]) -> list[Any]:
+        """Run `judge.judge(...)` for each request, returning results or exceptions in order.
+
+        Uses `judge_executor` (when configured and failures are non-fatal) to
+        run independent judge calls concurrently across top-k candidates;
+        otherwise falls back to calling them one at a time.
+        """
+
+        if not requests:
+            return []
+
+        if self.judge_executor is not None and not self.config.raise_on_failure:
+            futures = [self.judge_executor.submit(self.judge.judge, request) for request in requests]
+            results: list[Any] = []
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except BaseException as exc:  # noqa: BLE001 - surfaced to the caller as a per-item failure
+                    results.append(exc)
+            return results
+
+        results = []
+        for request in requests:
+            try:
+                results.append(self.judge.judge(request))
+            except BaseException as exc:  # noqa: BLE001 - surfaced to the caller as a per-item failure
+                results.append(exc)
+        return results
 
     def snapshot(self) -> ShadowCollectorSnapshot:
         with self._lock:
