@@ -4,10 +4,11 @@
     dataset with sensible defaults, so you don't need to remember the flags.
 
 .DESCRIPTION
-    Builds the cache with MLCache.from_preset (via run_cache.py), prefits the
-    scorers, replays the query stream, and writes the experiment artifacts
+    Builds the cache with MLCache.from_preset (via run_cache.py), calibrates
+    it with cache.prefit_and_calibrate(...) against a target false-accept-rate
+    budget, replays the query stream, and writes the experiment artifacts
     (summary_metrics.json, per_request_decisions.csv, runtime_config.json,
-    schema_report.json) to the output directory.
+    schema_report.json, calibration_report.json) to the output directory.
 
 .EXAMPLE
     .\scripts\run_cache.ps1
@@ -28,7 +29,7 @@ param(
     [string]$OutputDir = "$PSScriptRoot\..\experiments\h1h0_ensemble",
     [string]$Scorer = "ensemble",
     [string]$Scorers = "cosine,lda,pca_whitened_cosine,xgboost,mlp",
-    [double]$PairThreshold = 0.05,
+    [double]$TargetFpr = 0.05,
     [int]$TopK = 5,
     [Nullable[int]]$MaxRows = $null,
     [switch]$NoFilePersistence
@@ -54,7 +55,7 @@ $arguments = @(
     "--query-embedding-field", "emb",
     "--scorer", $Scorer,
     "--scorers", $Scorers,
-    "--pair-threshold", $PairThreshold,
+    "--target-fpr", $TargetFpr,
     "--top-k", $TopK
 )
 

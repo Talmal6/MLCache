@@ -42,13 +42,20 @@ python scripts/run_cache.py \
   --anchor-field global_cluster \
   --query-embedding-field emb \
   --scorer ensemble \
-  --scorers cosine,lda,pca_whitened_cosine,xgboost,mlp
+  --scorers cosine,lda,pca_whitened_cosine,xgboost,mlp \
+  --target-fpr 0.05
 ```
 
-This builds the cache with `MLCache.from_preset`, prefits trainable scorers on
-the dataset's H0/H1 examples, indexes the anchors, replays the query stream,
-and writes `summary_metrics.json`, `per_request_decisions.csv`,
-`runtime_config.json`, and `schema_report.json` to the output directory.
+This builds the cache with `MLCache.from_preset`, adapts the dataset's
+ground-truth H0/H1 rows into `JudgedPairExample`s, and hands them to
+`cache.prefit_and_calibrate(judged_pairs, target_fpr=...)` — which owns the
+whole cold-start sequence (fit any trainable scorer, score H0 pairs, and pick
+a Neyman-Pearson threshold for the requested `--target-fpr` budget) — before
+indexing the anchors and replaying the query stream. The script never scores
+pairs or sets a threshold by hand; `--target-fpr` is the only calibration knob.
+It writes `summary_metrics.json`, `per_request_decisions.csv`,
+`runtime_config.json`, `schema_report.json`, and `calibration_report.json`
+(the dict returned by `prefit_and_calibrate`) to the output directory.
 
 ## Mock LLM wrapper
 
@@ -140,6 +147,63 @@ run.
 continues on the frozen policy — and the system can also freeze itself
 automatically once its convergence-stopping controller decides online metrics
 have stabilized (`freeze_reason="online_metrics_converged"` in the report).
+
+### Diagnosing the online lifecycle
+
+`scripts/diagnose_semantic_cache_lifecycle.py` replays a deterministic,
+fully-offline prompt stream through `SemanticCacheSystem` and prints/exports
+batch-by-batch evidence of the lifecycle described above — in particular, that
+
+```text
+top-k retrieved candidates
+  -> judged in shadow mode (every candidate, not just the served one)
+  -> stored as H0/H1 pairs in the judge training store
+  -> used for training/calibration
+  -> not limited to the served/accepted candidate
+```
+
+Each logged batch breaks the judge training store down into pairs for the
+*served* candidate vs. pairs for *retrieved-but-rejected* candidates (the
+latter identified via MISS decisions, where no candidate was served — so every
+pair stored under a MISS is, by construction, a rejected one), so you can
+watch the rejected share grow alongside the served share as traffic replays:
+
+```bash
+python scripts/diagnose_semantic_cache_lifecycle.py \
+  --scorer cosine \
+  --top-k 5 \
+  --batch-size 20 \
+  --target-fpr 0.25 \
+  --requests 300 \
+  --output-dir runs/diagnose_lifecycle_cosine
+
+python scripts/diagnose_semantic_cache_lifecycle.py \
+  --scorer ensemble \
+  --scorers cosine,lda,pca_whitened_cosine,xgboost,mlp \
+  --top-k 5 \
+  --batch-size 20 \
+  --target-fpr 0.25 \
+  --requests 500 \
+  --output-dir runs/diagnose_lifecycle_ensemble
+```
+
+It writes a full timeline (per-batch report + store breakdown) to
+`<output-dir>/lifecycle_report.json`. `runs/` is gitignored — these are local
+diagnostic artifacts, not committed experiment results.
+
+### Invariant test: shadow judging isn't limited to served candidates
+
+`tests/test_semantic_cache_system.py::JudgedPairAccumulationTests::test_shadow_pairs_from_rejected_candidates_reach_the_training_store_and_drive_calibration`
+protects the property the diagnostic script makes visible: shadow top-k
+judging labels *every* retrieved candidate — including ones the active policy
+rejected — and those judged pairs land in the very same store that feeds
+training/calibration (`_refit_rows_from_training_store` reads exactly those
+buckets). It asserts that judged pairs from MISS decisions (where no candidate
+was served, so every stored pair is necessarily a retrieved-but-rejected
+candidate) are present with both H0 and H1 labels, that more pairs are stored
+than the system ever served from cache, and that the system still reaches a
+trained, calibrated policy — proof that online learning draws on
+retrieved-but-rejected candidates, not only the served/accepted one.
 
 ### `LLMJudge`: turning an `LLMClient` into a `SemanticReuseJudge`
 

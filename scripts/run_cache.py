@@ -1,10 +1,17 @@
 """Construct an MLCache with one constructor call and replay an H1/H0 NPZ stream.
 
 This is the normal way to exercise the cache end to end: build it with
-`MLCache.from_preset`, prefit any trainable scorers on H0/H1 examples, index
-the anchors, and replay the incoming-query stream while writing the standard
-experiment artifacts (summary_metrics.json, per_request_decisions.csv,
-runtime_config.json, schema_report.json).
+`MLCache.from_preset`, adapt the dataset's ground-truth H0/H1 rows into judged
+pairs, and hand them to `cache.prefit_and_calibrate(...)` -- which owns the
+whole cold-start sequence (fit any trainable scorer, score H0 pairs, and pick
+a Neyman-Pearson threshold for the requested `--target-fpr` budget) -- before
+indexing the anchors and replaying the incoming-query stream. This script
+never computes pair scores or sets a threshold itself; `cache.set_threshold`
+is reserved for callers who already have a calibrated threshold in hand.
+
+Writes the standard experiment artifacts: summary_metrics.json,
+per_request_decisions.csv, runtime_config.json, schema_report.json, and
+calibration_report.json (the dict returned by `prefit_and_calibrate`).
 """
 
 from __future__ import annotations
@@ -28,9 +35,10 @@ from mlcache import (  # noqa: E402
     H1H0NPZDataset,
     H1H0NPZJudgeAdapter,
     H1H0NPZStreamAdapter,
+    JudgeDecision,
+    JudgedPairExample,
     JudgeLabel,
     JudgeRequest,
-    LabeledPairBatch,
     SCORER_PRESET_NAMES,
 )
 from mlcache.persistence import json_safe  # noqa: E402
@@ -77,7 +85,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Comma-separated scorer presets used as ensemble members (only with --scorer ensemble).",
     )
-    parser.add_argument("--pair-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--target-fpr",
+        type=float,
+        default=0.05,
+        help="False-accept-rate budget for Neyman-Pearson calibration via cache.prefit_and_calibrate(...).",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--no-file-persistence", action="store_true")
     parser.add_argument("--no-allow-pickle", action="store_true")
@@ -114,8 +127,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         scorers = args.scorers.split(",") if args.scorers else None
         cache = _build_cache(args, output_dir, scorers=scorers)
-        _prefit(cache, records)
-        cache.set_threshold(args.pair_threshold)
+
+        # The cache owns the whole cold-start sequence -- fit (if trainable),
+        # score H0 pairs, and pick a Neyman-Pearson threshold for the
+        # requested FPR budget -- from judged pairs alone; this script never
+        # scores pairs or sets a threshold itself.
+        judged_pairs = _judged_pairs(records, feature_builder=cache.runtime.oracle.feature_builder)
+        calibration_report = cache.prefit_and_calibrate(
+            judged_pairs,
+            target_fpr=float(args.target_fpr),
+            fit_kwargs={"alpha": 0.05, "seed": 42},
+        )
+        _write_json(output_dir / "calibration_report.json", calibration_report)
+
         cache.index(anchors)
 
         decision_rows, counters = _replay(cache, stream, judge, progress_every=int(args.progress_every))
@@ -124,7 +148,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         runtime_config = {
             "scorer": args.scorer,
             "scorers": scorers,
-            "pair_threshold": float(args.pair_threshold),
+            "target_fpr": float(args.target_fpr),
+            "calibrated_threshold": float(calibration_report["threshold"]),
             "top_k": int(args.top_k),
             "persistence": not args.no_file_persistence,
             "components": cache.components,
@@ -194,15 +219,55 @@ def _build_cache(args: argparse.Namespace, output_dir: Path, *, scorers: list[st
         raise RunCacheError(str(exc) or ML_DEPENDENCIES_ERROR) from exc
 
 
-def _prefit(cache: MLCache, records: tuple[Any, ...]) -> None:
-    h0 = [record.query_embedding for record in records if int(record.label) == 0]
-    h1 = [record.query_embedding for record in records if int(record.label) == 1]
-    if not h0 or not h1:
-        return
-    try:
-        cache.prefit(LabeledPairBatch(h0=h0, h1=h1), alpha=0.05, seed=42)
-    except ImportError as exc:
-        raise RunCacheError(str(exc) or ML_DEPENDENCIES_ERROR) from exc
+def _judged_pairs(records: tuple[Any, ...], *, feature_builder: Any) -> list[JudgedPairExample]:
+    """Adapt H1/H0 dataset rows into judged pairs for `cache.prefit_and_calibrate`.
+
+    The dataset's ground-truth labels stand in for a live judge's verdicts --
+    there is no judge to call here, only a labeled offline dataset to replay.
+    Features are built with the cache's own `feature_builder` so the judged
+    pairs are scored exactly as the active scorer expects them.
+    """
+
+    pairs: list[JudgedPairExample] = []
+    for record in records:
+        features = feature_builder.build(record.query_embedding, record.anchor_embedding)
+        label = JudgeLabel.REUSABLE if int(record.label) == 1 else JudgeLabel.NOT_REUSABLE
+        request = JudgeRequest(
+            query=record.query,
+            candidate_query=record.anchor_query,
+            candidate_key=record.anchor_key,
+        )
+        pairs.append(
+            JudgedPairExample(
+                features=_features_to_tuple(features),
+                request=request,
+                decision=JudgeDecision(label=label),
+                metadata={"row_id": record.row_id, "query_id": record.query_id},
+            )
+        )
+    return pairs
+
+
+def _features_to_tuple(features: Any) -> tuple[float, ...]:
+    """Flatten whichever representation the cache's `feature_builder` populated.
+
+    Mirrors `DefaultShadowTopKCollector._features_to_tuple` so judged pairs
+    built here are scored exactly as the active scorer expects them,
+    regardless of which `PairFeatureBuilder` preset is in play.
+    """
+
+    if features.concat:
+        return tuple(float(value) for value in features.concat)
+    if features.hadamard:
+        return tuple(float(value) for value in features.hadamard)
+    if features.abs_diff:
+        return tuple(float(value) for value in features.abs_diff)
+    if features.cosine is not None:
+        return (float(features.cosine),)
+    main = features.values.get("main")
+    if main is not None:
+        return tuple(float(value) for value in main)
+    return ()
 
 
 def _replay(

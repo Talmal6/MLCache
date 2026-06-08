@@ -146,7 +146,7 @@ class RunCacheScriptSmokeTests(unittest.TestCase):
                     "ensemble",
                     "--scorers",
                     "cosine,lda,pca_whitened_cosine,xgboost,mlp",
-                    "--pair-threshold",
+                    "--target-fpr",
                     "0.05",
                     "--top-k",
                     "5",
@@ -155,7 +155,13 @@ class RunCacheScriptSmokeTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            for name in ("summary_metrics.json", "per_request_decisions.csv", "runtime_config.json", "schema_report.json"):
+            for name in (
+                "summary_metrics.json",
+                "per_request_decisions.csv",
+                "runtime_config.json",
+                "schema_report.json",
+                "calibration_report.json",
+            ):
                 self.assertTrue((output_dir / name).exists(), f"missing artifact: {name}")
 
 
