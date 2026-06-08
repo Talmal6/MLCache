@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -43,7 +45,8 @@ class SentenceTransformersEmbeddingProvider(EmbeddingProvider):
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
             raise RuntimeError(
-                'Missing optional dependency sentence-transformers. Install with: python -m pip install -e ".[embeddings]"'
+                "Missing optional dependency sentence-transformers. "
+                "Install embedding dependencies with: pip install -e '.[embeddings,dev]'"
             ) from exc
 
         try:
@@ -54,4 +57,29 @@ class SentenceTransformersEmbeddingProvider(EmbeddingProvider):
             ) from exc
 
 
-__all__ = ["EmbeddingProvider", "SentenceTransformersEmbeddingProvider"]
+class HashingEmbeddingProvider(EmbeddingProvider):
+    """Deterministic offline embedding provider using the hashing trick.
+
+    Maps each whitespace token to a coordinate via a SHA-256 digest, so the
+    same text always yields the same vector with no model download or network
+    access. Useful for tests, smoke runs, and mock-LLM flows where a real
+    embedding model isn't available or desired.
+    """
+
+    def __init__(self, *, dimensions: int = 64) -> None:
+        self.dimensions = int(dimensions)
+
+    def embed(self, text: str) -> tuple[float, ...]:
+        vector = [0.0] * self.dimensions
+        for token in text.lower().split():
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:4], "big") % self.dimensions
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vector[index] += sign
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm > 0.0:
+            vector = [value / norm for value in vector]
+        return tuple(vector)
+
+
+__all__ = ["EmbeddingProvider", "HashingEmbeddingProvider", "SentenceTransformersEmbeddingProvider"]

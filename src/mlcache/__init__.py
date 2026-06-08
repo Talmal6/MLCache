@@ -55,7 +55,16 @@ from mlcache.feedback import (
     SplitJudgeTrainingStore,
     TrainingExampleEvictionPolicy,
 )
-from mlcache.embeddings import EmbeddingProvider, SentenceTransformersEmbeddingProvider
+from mlcache.builder import (
+    EMBEDDINGS_DEPENDENCIES_ERROR,
+    ML_DEPENDENCIES_ERROR,
+    MLCache,
+    SCORER_PRESET_NAMES,
+    build_mlcache,
+    build_scorer,
+)
+from mlcache.embeddings import EmbeddingProvider, HashingEmbeddingProvider, SentenceTransformersEmbeddingProvider
+from mlcache.llm_wrapper import CachedLLM, CachedLLMResponse, LLMClient, LLMResponse, MockLLM
 from mlcache.observability import AuditEvent, AuditLogger, DiagnosticsReporter, MetricsSink
 from mlcache.online import (
     FeedbackEvent,
@@ -143,6 +152,14 @@ __all__ = [
     "AuditEvent",
     "AuditLogger",
     "ActivationGateResult",
+    "EMBEDDINGS_DEPENDENCIES_ERROR",
+    "ML_DEPENDENCIES_ERROR",
+    "MLCache",
+    "SCORER_PRESET_NAMES",
+    "build_mlcache",
+    "build_scorer",
+    "CachedLLM",
+    "CachedLLMResponse",
     "CacheEntry",
     "CacheGatewayResult",
     "CacheKey",
@@ -168,6 +185,7 @@ __all__ = [
     "FileVectorStore",
     "FeedbackEvent",
     "FIFOTrainingExampleEvictionPolicy",
+    "HashingEmbeddingProvider",
     "H1H0NPZDataset",
     "H1H0NPZJudgeAdapter",
     "H1H0NPZRecord",
@@ -192,7 +210,10 @@ __all__ = [
     "LabeledPairBatch",
     "LearnedDirectPolicy",
     "LearnedVetoPolicy",
+    "LLMClient",
+    "LLMResponse",
     "MetricsSink",
+    "MockLLM",
     "MLCacheRuntime",
     "MLCacheRuntimeConfig",
     "NormalizedHadamardFeatureBuilder",
