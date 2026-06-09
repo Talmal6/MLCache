@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from math import isfinite
+from math import ceil, isfinite
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable, Iterator, Literal
@@ -170,6 +170,21 @@ class SemanticCacheSystem:
         _train_frac = (_cal_every_n - 1) / _cal_every_n if _cal_every_n > 1 else 1.0
         _cal_frac = 1.0 - _train_frac
 
+        # Wilson-safe minimum for min_calibration_h0: the activation gate uses
+        # the Wilson upper bound on empirical FPR; with k=0 false accepts the
+        # bound is z²/(n+z²).  We need z²/(n+z²) ≤ allowed_fpr_bound, so
+        # n ≥ z²*(1-allowed)/allowed.  If min_calibration_h0 is set below this
+        # value the gate can never pass regardless of how many H0 pairs exist,
+        # and `trained` stays False permanently.
+        _z = 1.96  # must equal ConservativeRefitConfig.wilson_confidence_z
+        _fpr_wilson_margin = max(0.03, float(target_fpr))
+        _allowed_fpr_bound = float(target_fpr) + _fpr_wilson_margin
+        _wilson_min_h0_calib = max(1, ceil(_z * _z * (1.0 - _allowed_fpr_bound) / _allowed_fpr_bound))
+        _min_calib_h0 = max(max(1, int(int(min_h0) * _cal_frac)), _wilson_min_h0_calib)
+        # Raise the fit-trigger threshold so when the fit fires, the calib
+        # bucket already has _min_calib_h0 examples.
+        _min_h0_for_fit = max(int(min_h0), ceil(_min_calib_h0 / _cal_frac) if _cal_frac > 0 else int(min_h0))
+
         self.cache = MLCache.from_preset(
             root_dir=root_dir,
             scorer=scorer,
@@ -213,24 +228,18 @@ class SemanticCacheSystem:
         # counts, so they are scaled by the train/calibration split fraction.
         oracle.refit_policy = ConservativeRefitPolicy(
             config=ConservativeRefitConfig(
-                min_h0_for_fit=int(min_h0),
+                min_h0_for_fit=_min_h0_for_fit,
                 min_h1_for_fit=int(min_h1),
-                min_h0_for_calibration=int(min_h0),
+                min_h0_for_calibration=_min_h0_for_fit,
                 min_train_total=max(2, int((int(min_h0) + int(min_h1)) * _train_frac)),
                 min_train_h0=max(1, int(int(min_h0) * _train_frac)),
                 min_train_h1=max(1, int(int(min_h1) * _train_frac)),
-                min_calibration_h0=max(1, int(int(min_h0) * _cal_frac)),
+                min_calibration_h0=_min_calib_h0,
                 min_calibration_h1=max(1, int(int(min_h1) * _cal_frac)),
-                min_new_h0_for_calibration=max(1, int(min_h0) // 2),
-                min_new_h0_for_refit=max(1, int(min_h0) // 2),
+                min_new_h0_for_calibration=max(1, _min_h0_for_fit // 4),
+                min_new_h0_for_refit=max(1, _min_h0_for_fit // 4),
                 min_new_h1_for_refit=max(1, int(min_h1) // 2),
-                # The default 0.03 Wilson margin demands hundreds of H0
-                # calibration examples before any threshold can be activated
-                # confidently.  Use 1 × target_fpr so allowed_fpr_bound lands
-                # at 2 × target_fpr -- still conservative, but reachable with
-                # the small calibration sets produced by min_h0-scale traffic
-                # rather than requiring production-scale pair counts.
-                fpr_wilson_margin=max(0.03, float(target_fpr)),
+                fpr_wilson_margin=_fpr_wilson_margin,
             )
         )
 

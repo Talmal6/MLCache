@@ -898,6 +898,73 @@ class OfflineCalibrationTests(unittest.TestCase):
             self.assertTrue(np.isfinite(float(cache.runtime.oracle._threshold)))
 
 
+class RefitPolicyWiringTests(unittest.TestCase):
+    """SemanticCacheSystem(min_h0=M, min_h1=N, batch_size=B, target_fpr=F) must
+    produce a ConservativeRefitPolicy scaled to those values — not the
+    production defaults (min_h0_for_fit=100, min_train_total=1200).
+
+    Critically, min_calibration_h0 must be large enough that the Wilson
+    activation gate can actually pass: z²/(n+z²) ≤ target_fpr + fpr_wilson_margin.
+    When this condition is not met the fit fires, but the gate always rejects
+    the result, and trained stays False permanently.
+    """
+
+    def _cfg(self, *, min_h0: int = 15, min_h1: int = 8,
+             batch_size: int = 20, target_fpr: float = 0.10) -> object:
+        with tempfile.TemporaryDirectory(prefix="scs-wiring-") as tmp:
+            system = SemanticCacheSystem(
+                llm=MockLLM(response_template="ans: {prompt}"),
+                min_h0=min_h0, min_h1=min_h1, batch_size=batch_size,
+                target_fpr=target_fpr, root_dir=tmp, persistence=False,
+            )
+            cfg = system.cache.runtime.oracle.refit_policy.config
+            system._executor.shutdown(wait=False)
+            return cfg
+
+    def test_not_production_defaults(self) -> None:
+        cfg = self._cfg()
+        self.assertNotEqual(cfg.min_h0_for_fit, 100, "min_h0_for_fit must not be the production default")
+        self.assertNotEqual(cfg.min_train_total, 1200, "min_train_total must not be the production default")
+
+    def test_min_h1_for_fit_equals_passed_value(self) -> None:
+        cfg = self._cfg(min_h1=8)
+        self.assertEqual(cfg.min_h1_for_fit, 8)
+
+    def test_min_h0_for_fit_is_at_least_passed_min_h0(self) -> None:
+        cfg = self._cfg(min_h0=15)
+        self.assertGreaterEqual(cfg.min_h0_for_fit, 15)
+
+    def test_train_splits_are_scaled_by_batch_size(self) -> None:
+        # batch_size=20 -> cal_every_n=2 -> train_frac=0.5
+        cfg = self._cfg(min_h0=20, min_h1=10, batch_size=20)
+        self.assertEqual(cfg.min_train_h0, 10)   # int(20 * 0.5)
+        self.assertEqual(cfg.min_train_h1, 5)    # int(10 * 0.5)
+
+    def test_wilson_gate_is_achievable_with_min_calibration_h0_examples(self) -> None:
+        """With min_calibration_h0 H0 calib examples and 0 false accepts,
+        z²/(n+z²) must be ≤ target_fpr + fpr_wilson_margin.
+        If not, the activation gate can never open regardless of data volume."""
+        cfg = self._cfg(target_fpr=0.10)
+        z = cfg.wilson_confidence_z
+        allowed = 0.10 + cfg.fpr_wilson_margin
+        n = cfg.min_calibration_h0
+        wilson_upper_at_min = z * z / (n + z * z)
+        self.assertLessEqual(
+            wilson_upper_at_min, allowed,
+            f"Wilson gate unachievable at min_calibration_h0={n}: "
+            f"upper={wilson_upper_at_min:.4f} > allowed={allowed:.4f}",
+        )
+
+    def test_wilson_gate_achievable_at_fpr_25(self) -> None:
+        cfg = self._cfg(target_fpr=0.25)
+        z = cfg.wilson_confidence_z
+        allowed = 0.25 + cfg.fpr_wilson_margin
+        n = cfg.min_calibration_h0
+        wilson_upper_at_min = z * z / (n + z * z)
+        self.assertLessEqual(wilson_upper_at_min, allowed,
+                             f"Wilson gate unachievable at fpr=0.25: upper={wilson_upper_at_min:.4f}")
+
+
 class EndToEndConstructionTests(unittest.TestCase):
     def test_from_llm_and_stream_builds_and_runs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scs-from-llm-stream-") as tmp:
