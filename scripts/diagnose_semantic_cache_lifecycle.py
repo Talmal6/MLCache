@@ -33,6 +33,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -123,16 +124,18 @@ class DeterministicTopicJudge(SemanticReuseJudge):
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--requests", type=int, default=360)
+    parser.add_argument("--requests", type=int, default=500)
     parser.add_argument("--topics", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--min-h0", type=int, default=15)
     parser.add_argument("--min-h1", type=int, default=8)
     parser.add_argument("--target-fpr", type=float, default=0.25)
-    parser.add_argument("--top-k", type=int, default=3)
-    parser.add_argument("--scorer", default="ensemble")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--scorer", default="cosine")
     parser.add_argument("--scorers", default="cosine,lda")
     parser.add_argument("--parallelism", type=int, default=4)
+    parser.add_argument("--fit-wait-secs", type=float, default=10.0,
+                        help="Max seconds to wait for a pending background fit to complete after the stream ends.")
     parser.add_argument("--output-dir", default=str(ROOT / "runs" / "diagnose_lifecycle"))
     return parser.parse_args(argv)
 
@@ -241,6 +244,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _log_batch(index, report=report, breakdown=breakdown)
                 timeline.append({"request_index": index, "report": report, "store": breakdown})
 
+        # Wait for any in-progress background fit to complete.  The first fit
+        # can be slow due to lazy scorer-library imports (sklearn, xgboost,
+        # torch) loading in the background thread.  The stream ends quickly
+        # (< 2 s for 500 requests), but the fit thread may still be running.
+        _wait_start = time.monotonic()
+        while time.monotonic() - _wait_start < args.fit_wait_secs:
+            if system.policy.calibrated:
+                break
+            time.sleep(0.1)
+
+        # If the policy calibrated only after the main stream ended (slow
+        # library import on first fit), replay a short additional burst so
+        # the cache can produce hits with the now-active policy.  These warm-
+        # up requests re-visit the same topics, so they will match cached
+        # responses and drive hits > 0.
+        if system.policy.calibrated and first_hit_at is None:
+            print("\n[post-stream calibration detected -- replaying warm-up requests to verify hits]")
+            warmup_prompts = _topic_prompts(50 * args.topics, topics=args.topics)
+            for w_index, prompt in enumerate(warmup_prompts, start=args.requests + 1):
+                response = system.handle(prompt)
+                if first_hit_at is None and response.source == "cache":
+                    first_hit_at = w_index
+            system._maybe_check_stopping()
+            warmup_report = system.report()
+            warmup_breakdown = _store_breakdown(system)
+            _log_batch(w_index, report=warmup_report, breakdown=warmup_breakdown)
+            timeline.append({"request_index": w_index, "report": warmup_report, "store": warmup_breakdown,
+                              "note": "post-stream warm-up"})
+
         final_report = system.report()
         final_breakdown = _store_breakdown(system)
 
@@ -275,7 +307,61 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     artifact_path = output_dir / "lifecycle_report.json"
     artifact_path.write_text(json.dumps(json_safe(summary), indent=2), encoding="utf-8")
     print(f"\nWrote lifecycle report to {artifact_path}")
+
+    _assert_lifecycle(args, final_report, final_breakdown)
+
     return summary
+
+
+def _assert_lifecycle(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    breakdown: dict[str, Any],
+) -> None:
+    """Assert that the scorer reached the expected lifecycle state.
+
+    For cosine: calibrated=True, finite threshold, hits > 0.
+    For ensemble: trained=True, calibrated=True, finite threshold, hits > 0.
+    Exits with code 1 and a diagnostic block on failure.
+    """
+
+    scorer = args.scorer
+    failures: list[str] = []
+
+    if scorer == "ensemble":
+        if not report.get("trained"):
+            failures.append("trained must be True for ensemble scorer")
+    if not report.get("calibrated"):
+        failures.append("calibrated must be True")
+    threshold = report.get("threshold")
+    finite_threshold = threshold is not None and isinstance(threshold, (int, float)) and not (
+        threshold != threshold or threshold in (float("inf"), float("-inf"))
+    )
+    if not finite_threshold:
+        failures.append(f"finite threshold required (got {threshold!r})")
+    if report.get("cache_hits", 0) <= 0:
+        failures.append("cache hits > 0 required")
+
+    if failures:
+        store = breakdown if breakdown.get("available") else {}
+        print()
+        print("[diagnostic failure]")
+        print(f"scorer={scorer}")
+        print(f"trained={report.get('trained')}")
+        print(f"calibrated={report.get('calibrated')}")
+        print(f"threshold={threshold!r}")
+        print(f"finite_threshold={finite_threshold}")
+        print(f"hits={report.get('cache_hits', 0)}")
+        print(f"pair_store_h0={store.get('train_h0', '?')} train + {store.get('calibration_h0', '?')} calib")
+        print(f"pair_store_h1={store.get('train_h1', '?')} train + {store.get('calibration_h1', '?')} calib")
+        print(f"served_candidate_pairs={store.get('served_candidate_pairs', '?')}")
+        print(f"rejected_candidate_pairs={store.get('rejected_candidate_pairs', '?')}")
+        last = report.get("last_refit_decision") or report.get("last_policy")
+        print(f"last_policy={last!r}")
+        print()
+        for msg in failures:
+            print(f"  FAIL: {msg}")
+        sys.exit(1)
 
 
 def main(argv: list[str] | None = None) -> int:

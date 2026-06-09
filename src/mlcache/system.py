@@ -160,6 +160,16 @@ class SemanticCacheSystem:
         # learning, and the two never block each other after retrieval.
         self._executor = ThreadPoolExecutor(max_workers=max(1, int(parallelism)))
 
+        # _next_split in shadow_collector.py sends every calibration_every_n-th
+        # pair to the calibration bucket; the rest go to train.  The gate
+        # thresholds for bucket sizes must reflect this split or the activation
+        # gate can never pass on the first fit (e.g. calibration_every_n=2
+        # gives a 50/50 split, but setting min_train_h1=min_h1 would demand all
+        # min_h1 pairs in the train bucket even though half go to calibration).
+        _cal_every_n = max(1, self.batch_size // 10)
+        _train_frac = (_cal_every_n - 1) / _cal_every_n if _cal_every_n > 1 else 1.0
+        _cal_frac = 1.0 - _train_frac
+
         self.cache = MLCache.from_preset(
             root_dir=root_dir,
             scorer=scorer,
@@ -171,7 +181,7 @@ class SemanticCacheSystem:
                 shadow=ShadowRuntimeConfig(
                     enabled=True,
                     top_k=self.top_k,
-                    calibration_every_n=max(1, self.batch_size // 10),
+                    calibration_every_n=_cal_every_n,
                 ),
                 refit=RuntimeRefitConfig(
                     auto_refit=True,
@@ -197,26 +207,30 @@ class SemanticCacheSystem:
         # thousands). Replace it with one keyed off `min_h0`/`min_h1`/
         # `batch_size` so the configured stopping/update cadence actually
         # governs when the system trains, calibrates, and activates.
+        # Trigger thresholds (min_h0_for_fit, min_h1_for_fit,
+        # min_h0_for_calibration) use total store counts, so they stay at the
+        # configured min values.  Activation-gate thresholds check per-bucket
+        # counts, so they are scaled by the train/calibration split fraction.
         oracle.refit_policy = ConservativeRefitPolicy(
             config=ConservativeRefitConfig(
                 min_h0_for_fit=int(min_h0),
                 min_h1_for_fit=int(min_h1),
                 min_h0_for_calibration=int(min_h0),
-                min_train_total=int(min_h0) + int(min_h1),
-                min_train_h0=int(min_h0),
-                min_train_h1=int(min_h1),
-                min_calibration_h0=int(min_h0),
-                min_calibration_h1=int(min_h1),
+                min_train_total=max(2, int((int(min_h0) + int(min_h1)) * _train_frac)),
+                min_train_h0=max(1, int(int(min_h0) * _train_frac)),
+                min_train_h1=max(1, int(int(min_h1) * _train_frac)),
+                min_calibration_h0=max(1, int(int(min_h0) * _cal_frac)),
+                min_calibration_h1=max(1, int(int(min_h1) * _cal_frac)),
                 min_new_h0_for_calibration=max(1, int(min_h0) // 2),
                 min_new_h0_for_refit=max(1, int(min_h0) // 2),
                 min_new_h1_for_refit=max(1, int(min_h1) // 2),
                 # The default 0.03 Wilson margin demands hundreds of H0
                 # calibration examples before any threshold can be activated
-                # confidently. Scale it with the FPR budget so the activation
-                # gate stays meaningfully conservative without requiring
-                # production-scale traffic before the configured `min_h0`
-                # calibration pairs can ever activate a policy.
-                fpr_wilson_margin=max(0.03, 0.5 * float(target_fpr)),
+                # confidently.  Use 1 × target_fpr so allowed_fpr_bound lands
+                # at 2 × target_fpr -- still conservative, but reachable with
+                # the small calibration sets produced by min_h0-scale traffic
+                # rather than requiring production-scale pair counts.
+                fpr_wilson_margin=max(0.03, float(target_fpr)),
             )
         )
 

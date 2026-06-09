@@ -179,13 +179,21 @@ python scripts/diagnose_semantic_cache_lifecycle.py \
 
 python scripts/diagnose_semantic_cache_lifecycle.py \
   --scorer ensemble \
-  --scorers cosine,lda,pca_whitened_cosine,xgboost,mlp \
+  --scorers cosine,lda \
   --top-k 5 \
   --batch-size 20 \
   --target-fpr 0.25 \
   --requests 500 \
   --output-dir runs/diagnose_lifecycle_ensemble
 ```
+
+The ensemble command above uses the stable two-member default (`cosine,lda`).  To
+exercise the full five-member stack, pass `--scorers cosine,lda,pca_whitened_cosine,xgboost,mlp`
+and install all optional dependencies (`pip install -e '.[all]'`); the script
+waits up to `--fit-wait-secs` (default 10 s) for the first background fit to
+finish and then replays a short warm-up burst so the cache can demonstrate hits
+with the now-active policy.  Both runs exit 0 only if the lifecycle completes
+(`calibrated=True`, finite threshold, hits > 0).
 
 It writes a full timeline (per-batch report + store breakdown) to
 `<output-dir>/lifecycle_report.json`. `runs/` is gitignored — these are local
