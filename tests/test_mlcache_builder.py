@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import sys
 import tempfile
@@ -109,6 +110,22 @@ class MissingDependencyTests(unittest.TestCase):
             self.assertEqual(str(ctx.exception), ML_DEPENDENCIES_ERROR)
 
 
+def _ml_deps_available() -> bool:
+    """Return True when optional ML packages (xgboost, sklearn) are importable."""
+    for name in ("xgboost", "sklearn"):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            return False
+    return True
+
+
+_SKIP_ML_DEPS = unittest.skipUnless(
+    _ml_deps_available(),
+    "requires optional ML dependencies; install with pip install -e '.[ml,dev]'",
+)
+
+
 def _write_synthetic_npz(path: Path, *, row_count: int = 8) -> None:
     embeddings = np.eye(row_count, dtype=np.float32)
     np.savez(
@@ -120,7 +137,52 @@ def _write_synthetic_npz(path: Path, *, row_count: int = 8) -> None:
     )
 
 
+_EXPECTED_ARTIFACTS = (
+    "summary_metrics.json",
+    "per_request_decisions.csv",
+    "runtime_config.json",
+    "schema_report.json",
+    "calibration_report.json",
+)
+
+
 class RunCacheScriptSmokeTests(unittest.TestCase):
+    def test_run_cache_cosine_smoke_on_tiny_synthetic_npz(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mlcache-run-cache-cosine-") as tmp:
+            tmp_path = Path(tmp)
+            npz_path = tmp_path / "tiny_h1h0.npz"
+            _write_synthetic_npz(npz_path)
+            output_dir = tmp_path / "experiment"
+
+            exit_code = run_cache.main(
+                [
+                    "--npz",
+                    str(npz_path),
+                    "--output-dir",
+                    str(output_dir),
+                    "--label-field",
+                    "label",
+                    "--query-field",
+                    "text",
+                    "--anchor-field",
+                    "global_cluster",
+                    "--query-embedding-field",
+                    "emb",
+                    "--scorer",
+                    "cosine",
+                    "--target-fpr",
+                    "0.05",
+                    "--top-k",
+                    "3",
+                    "--no-file-persistence",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            for name in _EXPECTED_ARTIFACTS:
+                self.assertTrue((output_dir / name).exists(), f"missing artifact: {name}")
+
+    @_SKIP_ML_DEPS
     def test_run_cache_ensemble_smoke_on_tiny_synthetic_npz(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mlcache-run-cache-") as tmp:
             tmp_path = Path(tmp)
@@ -155,13 +217,7 @@ class RunCacheScriptSmokeTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            for name in (
-                "summary_metrics.json",
-                "per_request_decisions.csv",
-                "runtime_config.json",
-                "schema_report.json",
-                "calibration_report.json",
-            ):
+            for name in _EXPECTED_ARTIFACTS:
                 self.assertTrue((output_dir / name).exists(), f"missing artifact: {name}")
 
 
