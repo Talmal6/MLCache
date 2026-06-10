@@ -1,0 +1,16 @@
+2026-06-10T18:12:23 INFO logging initialized; run.log at experiments\retrieved_anchor_diag_smoke\run.log
+2026-06-10T18:12:23 INFO === RETRIEVED-ANCHOR DIAGNOSTICS ===
+2026-06-10T18:12:23 INFO npz: C:/Work/MLCache/data/h1h0_final.npz  output_dir: experiments\retrieved_anchor_diag_smoke  diag_scorer: cosine
+2026-06-10T18:12:32 INFO cache_universe=4000 clusters_with_gold_anchor=965 emb_dim=1024
+2026-06-10T18:12:32 INFO [cosine] cleared prior persisted state at experiments\retrieved_anchor_diag_smoke\state
+2026-06-10T18:12:32 WARNING [cosine] raised min_calibration_h0 20 -> 35 (Wilson-safe floor for target_fpr=0.050)
+2026-06-10T18:12:32 INFO [cosine] anchor-diagnostic replay of 2000 requests (scorer=cosine, top_k=5)
+2026-06-10T18:12:34 WARNING [cosine] cache HIT had no judged served-candidate label (self-pair skip or uncertain); excluded from FPR/TPR. Expected for exact-duplicate hits.
+2026-06-10T18:12:43 INFO [cosine][1000/2000] hits=466 trained=True calibrated=True thr=0.7714
+2026-06-10T18:13:01 INFO [cosine][2000/2000] hits=1108 trained=True calibrated=True thr=0.7706
+2026-06-10T18:13:02 INFO === ANCHOR DIAGNOSTIC RESULT ===
+2026-06-10T18:13:02 INFO gold_availability=0.2330 (466/2000) top1_gold=0.0590 (118/2000) topk_recall=0.2005 (401/2000)
+2026-06-10T18:13:02 INFO active_tp=81 active_fp=314 active_precision=0.2051 (81/395) active_fp_rate=0.7949 (314/395)
+2026-06-10T18:13:02 INFO scorer_tpr_given_gold_anchor=0.7932 (188/237)  dominant_active_fp_bucket=gold_anchor_absent
+2026-06-10T18:13:02 INFO verdict: This is a RETRIEVAL / anchor-selection problem, NOT a scorer/calibration problem: the scorer accepts the forced gold anchor at a high rate (0.7932 (188/237)) -- consistent with the passing np_compat / forced-gold modes -- yet online serves 314 active FPs because the dominant active-FP bucket is `gold_anchor_absent` and top-1 retrieval returns the gold anchor only 0.0590 (118/2000) of the time (gold available 0.2330 (466/2000)).
+2026-06-10T18:13:02 INFO artifacts -> C:\Work\MLCache\MLCache\experiments\retrieved_anchor_diag_smoke

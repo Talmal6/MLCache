@@ -1,0 +1,104 @@
+{
+  "active_fp_attribution": {
+    "different_cluster_confusion": 49,
+    "gold_anchor_absent": 260,
+    "gold_in_topk_not_selected": 17,
+    "gold_present_not_in_topk": 7,
+    "other": 30,
+    "same_cluster_confusion": 265
+  },
+  "config": {
+    "cache_universe": 4000,
+    "calibrated": true,
+    "diag_scorer": "cosine",
+    "final_threshold": 0.7706029415130615,
+    "label_distribution_selected": {
+      "0": 3423,
+      "1": 577
+    },
+    "max_requests": 2000,
+    "min_calib_h0": 20,
+    "min_calib_h1": 5,
+    "min_train_h0": 40,
+    "min_train_h1": 10,
+    "npz": "C:/Work/MLCache/data/h1h0_final.npz",
+    "output_dir": "experiments\\retrieved_anchor_diag_smoke",
+    "scorers": [
+      "cosine",
+      "lda",
+      "pca_whitened_cosine",
+      "xgboost",
+      "mlp"
+    ],
+    "seed": 42,
+    "selection": "mixed",
+    "stream_length": 2000,
+    "target_fpr": 0.05,
+    "top_k": 5,
+    "trained": true
+  },
+  "dominant_active_fp_bucket": "gold_anchor_absent",
+  "rates": {
+    "active_fp_rate": {
+      "denominator": 395,
+      "numerator": 314,
+      "value": 0.7949367088607595
+    },
+    "active_hit_rate": {
+      "denominator": 2000,
+      "numerator": 1108,
+      "value": 0.554
+    },
+    "active_precision": {
+      "denominator": 395,
+      "numerator": 81,
+      "value": 0.20506329113924052
+    },
+    "gold_anchor_cache_availability_rate": {
+      "denominator": 2000,
+      "numerator": 466,
+      "value": 0.233
+    },
+    "scorer_tpr_given_gold_anchor": {
+      "denominator": 237,
+      "numerator": 188,
+      "value": 0.7932489451476793
+    },
+    "top1_gold_match_rate": {
+      "denominator": 2000,
+      "numerator": 118,
+      "value": 0.059
+    },
+    "topk_gold_recall": {
+      "denominator": 2000,
+      "numerator": 401,
+      "value": 0.2005
+    },
+    "wrong_anchor_accept_rate": {
+      "denominator": 1202,
+      "numerator": 345,
+      "value": 0.2870216306156406
+    }
+  },
+  "raw_counts": {
+    "accepted_gold_anchor": 188,
+    "accepted_wrong_anchor": 345,
+    "active_fp": 314,
+    "active_judged_hits": 395,
+    "active_tp": 81,
+    "active_unjudged_hits": 713,
+    "different_cluster_wrong_anchor": 49,
+    "gold_anchor_available_count": 466,
+    "gold_anchor_missing_count": 1534,
+    "misses": 892,
+    "rejected_gold_anchor": 49,
+    "rejected_wrong_anchor": 857,
+    "same_cluster_wrong_anchor": 296,
+    "served_hits": 1108,
+    "top1_is_gold_anchor_count": 118,
+    "top1_wrong_anchor_count": 1881,
+    "topk_contains_gold_anchor_count": 401,
+    "topk_misses_gold_anchor_count": 1599,
+    "total_requests": 2000
+  }
+}

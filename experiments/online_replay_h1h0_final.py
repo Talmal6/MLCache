@@ -46,7 +46,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 SCRIPTS = ROOT / "scripts"
-for _p in (str(SRC), str(SCRIPTS)):
+EXP = ROOT / "experiments"
+for _p in (str(SRC), str(SCRIPTS), str(EXP)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -54,6 +55,11 @@ from mlcache import MockLLM, SemanticCacheSystem  # noqa: E402
 from mlcache.policies import ConservativeRefitConfig, ConservativeRefitPolicy  # noqa: E402
 from mlcache.policies.refit import RefitAction  # noqa: E402
 from mlcache.scorers.utils import score_rows_with_scorer  # noqa: E402
+
+# Gold-anchor machinery: the retrieved-anchor diagnostic compares against the
+# SAME centroid-nearest cluster anchor np_compat_pair_eval uses, so we import
+# its exact anchor-selection primitive rather than re-deriving it here.
+import np_compat_audit as nca  # noqa: E402
 
 # Proven, already-tested dataset components are reused rather than reimplemented.
 from compare_cosine_vs_ensemble import (  # noqa: E402
@@ -801,6 +807,696 @@ def _fmt(v: Any, digits: int = 4) -> str:
         return str(v)
 
 
+# ── retrieved-anchor diagnostic (audit: retrieval vs gold NP anchor) ────────
+#
+# np_compat_pair_eval (pair-level) and forced_gold_anchor_eval (online wrapper,
+# gold anchor forced) already PASS: the scorer + NP threshold + online wrapper
+# reproduce the calibrated pair experiment. So any residual *real online* active
+# false positives can only come from the one thing those two modes bypass:
+# retrieval / cache state choosing the anchor. This mode runs the REAL online
+# replay path (real SemanticCacheSystem, real retrieval, real serving) and, per
+# request, contrasts the anchor the online cache actually served against the gold
+# NP anchor for the query's cluster, so the FP can be attributed to a concrete
+# bucket (gold absent / not retrieved / not selected / wrong anchor accepted /
+# same- vs different-cluster confusion / self-pair).
+#
+# "gold anchor" here is np_compat's centroid_nearest cluster representative
+# (nca.select_region_anchor_indices) evaluated on EXACTLY the rows the online
+# system loaded (the cache universe) -- i.e. the achievable same-cluster anchor
+# the online cache could serve. When --cache-size covers the whole NPZ this is
+# byte-for-byte the np_compat_pair_eval gold anchor; on a subsample it is that
+# same rule restricted to retrievable rows (so "gold absent" measures cache
+# state, not a subsampling artifact).
+
+
+@dataclass(frozen=True)
+class AnchorDiagRecord:
+    """One real-online request's gold-vs-retrieved anchor comparison.
+
+    Stores only primitives observed at decision time; all diagnostic buckets are
+    derived from these by `aggregate_anchor_diagnostics`, so the counters are
+    unit-testable from hand-built records without running the online system.
+    """
+
+    request_index: int
+    query_id: int
+    query_label: int
+    query_cluster: str
+    gold_anchor_id: int | None
+    gold_anchor_label: int | None
+    gold_cluster: str | None
+    gold_anchor_available_in_cache: bool
+    top1_retrieved_id: int | None
+    retrieved_anchor_id: int | None
+    retrieved_anchor_label: int | None
+    retrieved_cluster: str | None
+    topk_contains_gold_anchor: bool
+    gold_pair_label: str           # H1 / H0 / UNCERTAIN / UNKNOWN
+    retrieved_pair_label: str      # H1 / H0 / UNCERTAIN / UNKNOWN / NONE
+    score_gold_anchor: float | None
+    score_retrieved_anchor: float | None
+    threshold: float | None
+    accepted_gold_anchor: bool     # FORCED: would the scorer accept the gold pair
+    served_hit: bool               # the real online serving decision (HIT)
+
+
+def _diag_top1_is_gold(r: AnchorDiagRecord) -> bool:
+    return r.top1_retrieved_id is not None and r.gold_anchor_id is not None and r.top1_retrieved_id == r.gold_anchor_id
+
+
+def _diag_retr_same_cluster(r: AnchorDiagRecord) -> bool:
+    return r.retrieved_cluster is not None and r.gold_cluster is not None and r.retrieved_cluster == r.gold_cluster
+
+
+def _diag_retr_diff_cluster(r: AnchorDiagRecord) -> bool:
+    return r.retrieved_cluster is not None and r.gold_cluster is not None and r.retrieved_cluster != r.gold_cluster
+
+
+def _diag_is_self_pair(r: AnchorDiagRecord) -> bool:
+    return r.served_hit and r.retrieved_anchor_id is not None and r.retrieved_anchor_id == r.query_id
+
+
+def _diag_served_class(r: AnchorDiagRecord) -> tuple[str, str | None]:
+    """Classify a request's SERVED decision: ('miss'|'tp'|'fp'|'unjudged', reason)."""
+    if not r.served_hit:
+        return ("miss", None)
+    if r.retrieved_anchor_id is None:
+        return ("unjudged", "unknown_anchor")
+    if r.retrieved_anchor_id == r.query_id:
+        return ("unjudged", "self_pair")
+    if r.retrieved_pair_label == "H1":
+        return ("tp", None)
+    if r.retrieved_pair_label == "H0":
+        return ("fp", None)
+    if r.retrieved_pair_label == "UNCERTAIN":
+        return ("unjudged", "uncertain_label")
+    return ("unjudged", "unknown_label")
+
+
+def _diag_accepted_wrong_anchor(r: AnchorDiagRecord) -> bool:
+    """System served/reused a non-gold, non-self anchor (retrieved != gold)."""
+    return (
+        r.served_hit
+        and r.retrieved_anchor_id is not None
+        and not _diag_is_self_pair(r)
+        and (r.gold_anchor_id is None or r.retrieved_anchor_id != r.gold_anchor_id)
+    )
+
+
+def _diag_rejected_wrong_anchor(r: AnchorDiagRecord) -> bool:
+    """A wrong anchor was the top-1 retrieved candidate but the request MISSED."""
+    return (
+        not r.served_hit
+        and r.top1_retrieved_id is not None
+        and (r.gold_anchor_id is None or r.top1_retrieved_id != r.gold_anchor_id)
+    )
+
+
+def _rate(num: int, den: int) -> dict[str, Any]:
+    """A rate plus its explicit numerator/denominator (never a bare percentage)."""
+    return {
+        "value": (float(num) / float(den)) if den > 0 else None,
+        "numerator": int(num),
+        "denominator": int(den),
+    }
+
+
+def aggregate_anchor_diagnostics(records: list[AnchorDiagRecord]) -> dict[str, Any]:
+    """Pure aggregation of per-request records into raw counts + derived rates.
+
+    Every rate carries its numerator and denominator. `active_fp_rate` and
+    `active_precision` are deliberately built from the SAME judged-served-hit
+    population (active_tp + active_fp == active_judged_hits) so they cannot
+    silently disagree.
+    """
+    total = len(records)
+
+    gold_available = sum(1 for r in records if r.gold_anchor_available_in_cache)
+    gold_missing = total - gold_available
+
+    top1_gold = sum(1 for r in records if _diag_top1_is_gold(r))
+    top1_wrong = sum(1 for r in records if r.top1_retrieved_id is not None and not _diag_top1_is_gold(r))
+    topk_gold = sum(1 for r in records if r.topk_contains_gold_anchor)
+    topk_miss = total - topk_gold
+
+    # Forced gold-anchor scorer view, restricted to gold pairs that SHOULD be
+    # accepted (gold_pair_label == H1) and where a forced decision is defined
+    # (scorer calibrated -> finite threshold + a score). This answers "if the
+    # gold anchor were forced, would the scorer accept it?" as a TPR.
+    gold_h1 = [
+        r for r in records
+        if r.gold_pair_label == "H1" and r.threshold is not None and r.score_gold_anchor is not None
+    ]
+    accepted_gold = sum(1 for r in gold_h1 if r.accepted_gold_anchor)
+    rejected_gold = len(gold_h1) - accepted_gold
+
+    # Wrong-anchor serving view (the REAL serving decision on a non-gold anchor).
+    accepted_wrong = sum(1 for r in records if _diag_accepted_wrong_anchor(r))
+    rejected_wrong = sum(1 for r in records if _diag_rejected_wrong_anchor(r))
+    same_cluster_wrong = sum(1 for r in records if _diag_accepted_wrong_anchor(r) and _diag_retr_same_cluster(r))
+    diff_cluster_wrong = sum(1 for r in records if _diag_accepted_wrong_anchor(r) and _diag_retr_diff_cluster(r))
+
+    # Active (served-hit) outcome view.
+    served_hits = sum(1 for r in records if r.served_hit)
+    misses = total - served_hits
+    classes = [_diag_served_class(r) for r in records]
+    active_tp = sum(1 for c, _ in classes if c == "tp")
+    active_fp = sum(1 for c, _ in classes if c == "fp")
+    active_unjudged = sum(1 for c, _ in classes if c == "unjudged")
+    active_judged_hits = active_tp + active_fp  # == judged served hits, by construction
+
+    raw_counts = {
+        "total_requests": total,
+        "gold_anchor_available_count": gold_available,
+        "gold_anchor_missing_count": gold_missing,
+        "top1_is_gold_anchor_count": top1_gold,
+        "top1_wrong_anchor_count": top1_wrong,
+        "topk_contains_gold_anchor_count": topk_gold,
+        "topk_misses_gold_anchor_count": topk_miss,
+        "accepted_gold_anchor": accepted_gold,
+        "rejected_gold_anchor": rejected_gold,
+        "accepted_wrong_anchor": accepted_wrong,
+        "rejected_wrong_anchor": rejected_wrong,
+        "same_cluster_wrong_anchor": same_cluster_wrong,
+        "different_cluster_wrong_anchor": diff_cluster_wrong,
+        "active_judged_hits": active_judged_hits,
+        "active_unjudged_hits": active_unjudged,
+        "active_tp": active_tp,
+        "active_fp": active_fp,
+        "served_hits": served_hits,
+        "misses": misses,
+    }
+
+    rates = {
+        "gold_anchor_cache_availability_rate": _rate(gold_available, total),
+        "top1_gold_match_rate": _rate(top1_gold, total),
+        "topk_gold_recall": _rate(topk_gold, total),
+        "scorer_tpr_given_gold_anchor": _rate(accepted_gold, accepted_gold + rejected_gold),
+        "wrong_anchor_accept_rate": _rate(accepted_wrong, accepted_wrong + rejected_wrong),
+        "active_precision": _rate(active_tp, active_tp + active_fp),
+        "active_fp_rate": _rate(active_fp, active_judged_hits),
+        "active_hit_rate": _rate(served_hits, total),
+    }
+
+    # Attribute each ACTIVE FALSE POSITIVE to a single bucket so the dominant
+    # failure mode is unambiguous.
+    fp_records = [r for r, (c, _) in zip(records, classes) if c == "fp"]
+    attribution = {
+        "gold_anchor_absent": 0,
+        "gold_present_not_in_topk": 0,
+        "gold_in_topk_not_selected": 0,
+        "other": 0,
+        "same_cluster_confusion": 0,
+        "different_cluster_confusion": 0,
+    }
+    for r in fp_records:
+        if not r.gold_anchor_available_in_cache:
+            attribution["gold_anchor_absent"] += 1
+        elif not r.topk_contains_gold_anchor:
+            attribution["gold_present_not_in_topk"] += 1
+        elif r.gold_anchor_id is None or r.retrieved_anchor_id != r.gold_anchor_id:
+            attribution["gold_in_topk_not_selected"] += 1
+        else:
+            attribution["other"] += 1
+        if _diag_retr_same_cluster(r):
+            attribution["same_cluster_confusion"] += 1
+        elif _diag_retr_diff_cluster(r):
+            attribution["different_cluster_confusion"] += 1
+
+    primary_buckets = {
+        k: attribution[k]
+        for k in ("gold_anchor_absent", "gold_present_not_in_topk", "gold_in_topk_not_selected", "other")
+    }
+    dominant = max(primary_buckets, key=primary_buckets.get) if active_fp > 0 else None
+
+    return {
+        "raw_counts": raw_counts,
+        "rates": rates,
+        "active_fp_attribution": attribution,
+        "dominant_active_fp_bucket": dominant,
+    }
+
+
+_ANCHOR_DIAG_FIELDS = [
+    "request_index", "query_id", "query_label", "query_cluster",
+    "gold_anchor_id", "gold_anchor_label", "gold_cluster", "gold_anchor_available_in_cache",
+    "top1_retrieved_anchor_id", "retrieved_anchor_id", "retrieved_anchor_label", "retrieved_cluster",
+    "top1_is_gold_anchor", "topk_contains_gold_anchor",
+    "retrieved_is_same_cluster_as_gold", "retrieved_is_different_cluster_from_gold",
+    "gold_pair_label", "retrieved_pair_label",
+    "score_gold_anchor", "score_retrieved_anchor", "threshold",
+    "accepted_gold_anchor", "accepted_retrieved_anchor",
+    "served_hit", "served_is_tp", "served_is_fp", "served_unjudged", "reason_if_unjudged",
+]
+
+
+def anchor_record_to_csv_row(r: AnchorDiagRecord) -> dict[str, Any]:
+    cls, reason = _diag_served_class(r)
+    return {
+        "request_index": r.request_index,
+        "query_id": r.query_id,
+        "query_label": r.query_label,
+        "query_cluster": r.query_cluster,
+        "gold_anchor_id": "" if r.gold_anchor_id is None else r.gold_anchor_id,
+        "gold_anchor_label": "" if r.gold_anchor_label is None else r.gold_anchor_label,
+        "gold_cluster": "" if r.gold_cluster is None else r.gold_cluster,
+        "gold_anchor_available_in_cache": bool(r.gold_anchor_available_in_cache),
+        "top1_retrieved_anchor_id": "" if r.top1_retrieved_id is None else r.top1_retrieved_id,
+        "retrieved_anchor_id": "" if r.retrieved_anchor_id is None else r.retrieved_anchor_id,
+        "retrieved_anchor_label": "" if r.retrieved_anchor_label is None else r.retrieved_anchor_label,
+        "retrieved_cluster": "" if r.retrieved_cluster is None else r.retrieved_cluster,
+        "top1_is_gold_anchor": _diag_top1_is_gold(r),
+        "topk_contains_gold_anchor": bool(r.topk_contains_gold_anchor),
+        "retrieved_is_same_cluster_as_gold": _diag_retr_same_cluster(r),
+        "retrieved_is_different_cluster_from_gold": _diag_retr_diff_cluster(r),
+        "gold_pair_label": r.gold_pair_label,
+        "retrieved_pair_label": r.retrieved_pair_label,
+        "score_gold_anchor": "" if r.score_gold_anchor is None else r.score_gold_anchor,
+        "score_retrieved_anchor": "" if r.score_retrieved_anchor is None else r.score_retrieved_anchor,
+        "threshold": "" if r.threshold is None else r.threshold,
+        "accepted_gold_anchor": bool(r.accepted_gold_anchor),
+        "accepted_retrieved_anchor": bool(r.served_hit),
+        "served_hit": bool(r.served_hit),
+        "served_is_tp": cls == "tp",
+        "served_is_fp": cls == "fp",
+        "served_unjudged": cls == "unjudged",
+        "reason_if_unjudged": reason or "",
+    }
+
+
+def compute_gold_anchor_map(
+    rows: list[DatasetRow], *, seed: int, strategy: str = "centroid_nearest",
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Per-cluster gold anchor (np_compat centroid_nearest) over the online universe.
+
+    Returns (gold_row_id_by_cluster, gold_label_by_cluster). Cluster ids are the
+    DatasetRow.group strings; they are factorised to dense int codes purely so
+    `nca.select_region_anchor_indices` can group them -- the anchor chosen depends
+    only on the grouping + embeddings + seed, exactly as np_compat_pair_eval.
+    """
+    if not rows:
+        return {}, {}
+    emb = np.stack([np.asarray(r.embedding, dtype=np.float32).reshape(-1) for r in rows])
+    clusters = [r.group for r in rows]
+    code_by_group = {g: i for i, g in enumerate(sorted(set(clusters)))}
+    region_id = np.array([code_by_group[g] for g in clusters], dtype=np.int64)
+    idx_by_code = nca.select_region_anchor_indices(emb, region_id, strategy=strategy, seed=int(seed))
+    gold_rid_by_cluster: dict[str, int] = {}
+    gold_label_by_cluster: dict[str, int] = {}
+    for group, code in code_by_group.items():
+        local_idx = idx_by_code.get(int(code))
+        if local_idx is None:
+            continue
+        anchor_row = rows[int(local_idx)]
+        gold_rid_by_cluster[group] = int(anchor_row.row_id)
+        gold_label_by_cluster[group] = int(anchor_row.label)
+    return gold_rid_by_cluster, gold_label_by_cluster
+
+
+def _emb_tuple(row: DatasetRow) -> tuple[float, ...]:
+    return tuple(float(v) for v in np.asarray(row.embedding, dtype=np.float64).reshape(-1))
+
+
+def replay_with_anchor_capture(
+    *,
+    method: str,
+    scorer: str,
+    scorers: list[str] | None,
+    stream: list[DatasetRow],
+    rows_by_id: dict[int, DatasetRow],
+    gold_rid_by_cluster: dict[str, int],
+    gold_label_by_cluster: dict[str, int],
+    target_fpr: float,
+    top_k: int,
+    batch_size: int,
+    gate_min_train_h0: int,
+    gate_min_train_h1: int,
+    gate_min_calib_h0: int,
+    gate_min_calib_h1: int,
+    parallelism: int,
+    persistence: bool,
+    state_dir: Path,
+    logger,
+    progress_every: int,
+) -> tuple[list[AnchorDiagRecord], dict[str, Any]]:
+    """Replay the REAL online path, capturing the decision-time top-k and the
+    served anchor per request so each can be compared against the gold NP anchor.
+
+    Retrieval is probed via the oracle's OWN vector store BEFORE serving (so the
+    candidate set is exactly what the oracle saw, prior to this request's
+    write-through), then `system.handle` performs the real serving + learning.
+    Nothing about the scorer, calibration, or policy is altered.
+    """
+    if state_dir.exists():
+        shutil.rmtree(state_dir, ignore_errors=True)
+        logger.info("[%s] cleared prior persisted state at %s", method, state_dir)
+
+    recorder = MetricsRecorder(method=method, target_fpr=float(target_fpr), logger=logger)
+    system = SemanticCacheSystem(
+        llm=MockLLM(response_template="answer: {prompt}"),
+        stream=None,
+        scorer=scorer,
+        scorers=scorers if scorer == "ensemble" else None,
+        judge=DatasetH1H0Judge(rows_by_id, recorder=recorder, logger=None),
+        embedding_provider=DatasetEmbeddingProvider(rows_by_id),
+        target_fpr=float(target_fpr),
+        top_k=int(top_k),
+        root_dir=state_dir,
+        batch_size=int(batch_size),
+        min_h0=int(gate_min_train_h0) + int(gate_min_calib_h0),
+        min_h1=int(gate_min_train_h1) + int(gate_min_calib_h1),
+        persistence=bool(persistence),
+        parallelism=int(parallelism),
+        namespace=f"h1h0-anchor-diag-{method}",
+    )
+    policy_obj, gate_diag = build_refit_policy(
+        min_train_h0=gate_min_train_h0, min_train_h1=gate_min_train_h1,
+        min_calib_h0=gate_min_calib_h0, min_calib_h1=gate_min_calib_h1,
+        target_fpr=target_fpr,
+    )
+    system.cache.runtime.oracle.refit_policy = policy_obj
+    if gate_diag.wilson_floor_applied:
+        logger.warning(
+            "[%s] raised min_calibration_h0 %d -> %d (Wilson-safe floor for target_fpr=%.3f)",
+            method, gate_diag.requested_min_calib_h0, gate_diag.effective_min_calib_h0, target_fpr,
+        )
+
+    oracle = system.cache.runtime.oracle
+    vstore = oracle.vector_store
+    key_to_row: dict[str, int] = {}
+    records: list[AnchorDiagRecord] = []
+
+    logger.info("[%s] anchor-diagnostic replay of %d requests (scorer=%s, top_k=%d)",
+                method, len(stream), ",".join(scorers) if scorers else scorer, top_k)
+    started = time.time()
+
+    for idx, row in enumerate(stream, start=1):
+        recorder.set_request_index(idx)
+        prompt = row.prompt
+        embedding = system._embeddings.embed(prompt)
+        query_emb_t = tuple(float(v) for v in embedding)
+
+        # ---- decision-time retrieval probe (BEFORE this request's write) ----
+        candidates = vstore.search(embedding, namespace=system.namespace, top_k=system.top_k)
+        cand_keys = [str(c.cache_key) for c in candidates]
+        top1_rid = key_to_row.get(cand_keys[0]) if cand_keys else None
+
+        gold_rid = gold_rid_by_cluster.get(row.group)
+        gold_label = gold_label_by_cluster.get(row.group)
+        gold_row = rows_by_id.get(gold_rid) if gold_rid is not None else None
+        gold_key = system._cache_key_for(gold_row.prompt) if gold_row is not None else None
+        gold_available = bool(gold_key is not None and vstore.get(gold_key) is not None)
+        topk_contains_gold = bool(gold_key is not None and str(gold_key) in cand_keys)
+
+        # ---- forced gold-anchor score under the CURRENT serving policy ----
+        pre_scorer = oracle.scorer
+        pre_threshold = system.cache.threshold
+        score_gold: float | None = None
+        if gold_row is not None:
+            feats_g = oracle.feature_builder.build(query_emb_t, _emb_tuple(gold_row))
+            sg = oracle._safe_score(pre_scorer, feats_g)
+            score_gold = None if sg is None else float(sg)
+
+        # ---- serve through the REAL online path (retrieval + scoring + learn) ----
+        response = system.handle(prompt)
+        if response.source == "llm" and response.cache_key is not None:
+            key_to_row[response.cache_key] = row.row_id
+        recorder.resolve_request(
+            idx, source=response.source,
+            accepted_key=response.cache_key if response.source == "cache" else None,
+        )
+
+        served_hit = response.source == "cache"
+        served_rid = key_to_row.get(response.cache_key) if served_hit else None
+        retrieved_rid = served_rid if served_hit else top1_rid
+        threshold = (
+            float(response.threshold) if response.threshold is not None
+            else (float(pre_threshold) if pre_threshold is not None else None)
+        )
+
+        if served_hit:
+            score_retr = float(response.score) if response.score is not None else None
+        elif top1_rid is not None and top1_rid in rows_by_id:
+            feats_r = oracle.feature_builder.build(query_emb_t, _emb_tuple(rows_by_id[top1_rid]))
+            sr = oracle._safe_score(pre_scorer, feats_r)
+            score_retr = None if sr is None else float(sr)
+        else:
+            score_retr = None
+
+        accepted_gold_forced = bool(
+            threshold is not None and score_gold is not None and score_gold >= threshold
+        )
+
+        retrieved_row = rows_by_id.get(retrieved_rid) if retrieved_rid is not None else None
+        gold_pair_label = reuse_label(row, gold_row) if gold_row is not None else "UNKNOWN"
+        if retrieved_row is not None:
+            retrieved_pair_label = reuse_label(row, retrieved_row)
+        elif served_hit or top1_rid is not None:
+            retrieved_pair_label = "UNKNOWN"
+        else:
+            retrieved_pair_label = "NONE"
+
+        records.append(AnchorDiagRecord(
+            request_index=idx,
+            query_id=row.row_id, query_label=row.label, query_cluster=row.group,
+            gold_anchor_id=gold_rid, gold_anchor_label=gold_label,
+            gold_cluster=(gold_row.group if gold_row is not None else None),
+            gold_anchor_available_in_cache=gold_available,
+            top1_retrieved_id=top1_rid,
+            retrieved_anchor_id=retrieved_rid,
+            retrieved_anchor_label=(retrieved_row.label if retrieved_row is not None else None),
+            retrieved_cluster=(retrieved_row.group if retrieved_row is not None else None),
+            topk_contains_gold_anchor=topk_contains_gold,
+            gold_pair_label=gold_pair_label,
+            retrieved_pair_label=retrieved_pair_label,
+            score_gold_anchor=score_gold,
+            score_retrieved_anchor=score_retr,
+            threshold=threshold,
+            accepted_gold_anchor=accepted_gold_forced,
+            served_hit=served_hit,
+        ))
+
+        if idx % max(1, batch_size) == 0:
+            system._maybe_check_stopping()
+        if progress_every > 0 and idx % progress_every == 0:
+            pol = snapshot_policy(system)
+            served = sum(1 for r in records if r.served_hit)
+            logger.info("[%s][%d/%d] hits=%d trained=%s calibrated=%s thr=%s",
+                        method, idx, len(stream), served, pol["trained"], pol["calibrated"],
+                        _fmt(pol["threshold"]))
+
+    final_policy = snapshot_policy(system)
+    final_policy["runtime_seconds"] = time.time() - started
+    final_policy["gate_diagnostics"] = gate_diag.__dict__
+    system._executor.shutdown(wait=False)
+    return records, final_policy
+
+
+def write_anchor_diagnostics(
+    out_dir: Path,
+    records: list[AnchorDiagRecord],
+    metrics: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_csv_rows(
+        out_dir / "anchor_retrieval_diagnostics.csv",
+        [anchor_record_to_csv_row(r) for r in records],
+        _ANCHOR_DIAG_FIELDS,
+    )
+    write_json(out_dir / "retrieved_anchor_metrics.json", {"config": config, **metrics})
+    (out_dir / "retrieved_anchor_diagnostics.md").write_text(
+        _render_anchor_markdown(metrics, config), encoding="utf-8"
+    )
+
+
+def _rate_str(rate: dict[str, Any]) -> str:
+    v = rate["value"]
+    vs = "n/a" if v is None else f"{v:.4f}"
+    return f"{vs} ({rate['numerator']}/{rate['denominator']})"
+
+
+def _render_anchor_markdown(metrics: dict[str, Any], config: dict[str, Any]) -> str:
+    rc = metrics["raw_counts"]
+    rt = metrics["rates"]
+    attr = metrics["active_fp_attribution"]
+    dom = metrics["dominant_active_fp_bucket"]
+
+    lines = [
+        "# Retrieved-Anchor Diagnostics (real online replay vs gold NP anchor)",
+        "",
+        f"- npz: `{config.get('npz')}`  scorer: `{config.get('diag_scorer')}`  seed: {config.get('seed')}",
+        f"- cache_universe: {config.get('cache_universe')}  stream_length: {config.get('stream_length')}  "
+        f"top_k: {config.get('top_k')}  target_fpr: {config.get('target_fpr')}  selection: {config.get('selection')}",
+        f"- gold anchor rule: np_compat centroid_nearest over the cache universe (== np_compat_pair_eval anchor "
+        f"restricted to retrievable rows)",
+        "",
+        "## Raw counts (every rate below prints numerator/denominator)",
+        "",
+        "| count | value |",
+        "|---|---:|",
+    ]
+    for k, v in rc.items():
+        lines.append(f"| {k} | {v} |")
+
+    lines += [
+        "",
+        "## Derived rates",
+        "",
+        "| rate | value (num/den) |",
+        "|---|---|",
+    ]
+    for k, rate in rt.items():
+        lines.append(f"| {k} | {_rate_str(rate)} |")
+
+    lines += [
+        "",
+        "## Active false-positive attribution",
+        "",
+        f"- gold_anchor_absent: {attr['gold_anchor_absent']}",
+        f"- gold_present_not_in_topk: {attr['gold_present_not_in_topk']}",
+        f"- gold_in_topk_not_selected: {attr['gold_in_topk_not_selected']}",
+        f"- other: {attr['other']}",
+        f"- same_cluster_confusion: {attr['same_cluster_confusion']}",
+        f"- different_cluster_confusion: {attr['different_cluster_confusion']}",
+        f"- **dominant active-FP bucket: {dom}**",
+        "",
+        "## Direct answers",
+        "",
+        f"1. Gold anchor available in cache: {_rate_str(rt['gold_anchor_cache_availability_rate'])}.",
+        f"2. Top-1 retrieval returns the gold anchor: {_rate_str(rt['top1_gold_match_rate'])}.",
+        f"3. Gold anchor present in top-k: {_rate_str(rt['topk_gold_recall'])}.",
+        f"4. When online serves a false positive ({rc['active_fp']} FPs), the dominant cause is "
+        f"`{dom}` (absent={attr['gold_anchor_absent']}, present-but-not-in-topk="
+        f"{attr['gold_present_not_in_topk']}, in-topk-not-selected={attr['gold_in_topk_not_selected']}).",
+        f"5. Wrong accepted anchors by cluster: same-cluster={attr['same_cluster_confusion']}, "
+        f"different-cluster={attr['different_cluster_confusion']}.",
+        f"6. If the gold anchor were forced, the scorer accepts the H1 gold pair at "
+        f"{_rate_str(rt['scorer_tpr_given_gold_anchor'])} (forced gold-anchor acceptance among judged H1 gold "
+        f"pairs).",
+        "7. " + _anchor_verdict(metrics),
+        "",
+        "## Interpretation rule",
+        "",
+        "np_compat_pair_eval and forced_gold_anchor_eval already pass, so the scorer + NP threshold are not the "
+        "cause unless `scorer_tpr_given_gold_anchor` is low (the scorer rejects even the correct, forced gold "
+        "anchor). If gold-anchor acceptance is high but online active FPs are high, the failure is retrieval / "
+        "anchor selection / cache state, per the attribution above -- NOT the scorer or calibration.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _anchor_verdict(metrics: dict[str, Any]) -> str:
+    rc = metrics["raw_counts"]
+    rt = metrics["rates"]
+    tpr = rt["scorer_tpr_given_gold_anchor"]["value"]
+    dom = metrics["dominant_active_fp_bucket"]
+    if rc["active_fp"] == 0:
+        return ("No active false positives in this run: the served judged anchors were all true positives, so "
+                "there is no online FP gap to attribute here.")
+
+    tpr_str = _rate_str(rt["scorer_tpr_given_gold_anchor"])
+    retrieval_clause = (
+        f"the dominant active-FP bucket is `{dom}` and top-1 retrieval returns the gold anchor only "
+        f"{_rate_str(rt['top1_gold_match_rate'])} of the time (gold available "
+        f"{_rate_str(rt['gold_anchor_cache_availability_rate'])})"
+    )
+
+    if tpr is None:
+        return ("Inconclusive on the scorer axis: no judged H1 gold pairs had a calibrated forced decision in "
+                f"this run, so gold-anchor acceptance could not be measured. The {rc['active_fp']} active FPs are "
+                f"still attributable by retrieval: {retrieval_clause}.")
+    if tpr >= 0.7:
+        return ("This is a RETRIEVAL / anchor-selection problem, NOT a scorer/calibration problem: the scorer "
+                f"accepts the forced gold anchor at a high rate ({tpr_str}) -- consistent with the passing "
+                f"np_compat / forced-gold modes -- yet online serves {rc['active_fp']} active FPs because "
+                f"{retrieval_clause}.")
+    if tpr < 0.5:
+        return ("This looks like a SCORER / calibration problem: even the forced gold anchor is accepted at only "
+                f"{tpr_str}, so the scorer rejects correct anchors -- inconsistent with the passing "
+                "np_compat / forced-gold modes; re-check the online calibration path before blaming retrieval.")
+    return ("MIXED: the forced gold anchor is accepted at a middling rate "
+            f"({tpr_str}), so the scorer is imperfect on the gold anchor, but retrieval is also implicated -- "
+            f"{retrieval_clause}. Both axes contribute; the dominant active-FP bucket is `{dom}`.")
+
+
+def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]:
+    if args.output_dir:
+        out_dir = Path(args.output_dir)
+    else:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out_dir = ROOT.parent / "experiments" / f"retrieved_anchor_diag_{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_logging(out_dir)
+
+    logger.info("=== RETRIEVED-ANCHOR DIAGNOSTICS ===")
+    logger.info("npz: %s  output_dir: %s  diag_scorer: %s", args.npz, str(out_dir), args.diag_scorer)
+
+    rows, schema = load_rows(
+        args.npz, query_field=args.query_field, label_field=args.label_field,
+        anchor_field=args.anchor_field, embedding_field=args.embedding_field,
+        max_rows=int(args.cache_size), seed=int(args.seed),
+        include_uncertain=False, selection="random", allow_pickle=True,
+    )
+    dist = schema["label_distribution_selected"]
+    if int(dist.get("0", 0)) <= 0 or int(dist.get("1", 0)) <= 0:
+        raise ValueError(f"Selected rows need both label=0 and label=1; got {dist}.")
+    rows_by_id = {r.row_id: r for r in rows}
+    gold_rid_by_cluster, gold_label_by_cluster = compute_gold_anchor_map(rows, seed=int(args.seed))
+    logger.info("cache_universe=%d clusters_with_gold_anchor=%d emb_dim=%d",
+                len(rows), len(gold_rid_by_cluster), schema["embedding_dim"])
+
+    stream, selection_diag = build_stream(
+        rows, max_requests=int(args.max_requests), seed=int(args.seed),
+        selection=str(args.selection), reuse_clusters_top_k=int(args.reuse_clusters_top_k),
+        reuse_min_cluster_size=int(args.reuse_min_cluster_size),
+        mixed_reuse_fraction=float(args.mixed_reuse_fraction),
+    )
+
+    scorers = [s.strip() for s in args.scorers.split(",") if s.strip()]
+    diag_scorers = scorers if args.diag_scorer == "ensemble" else None
+
+    records, final_policy = replay_with_anchor_capture(
+        method=args.diag_scorer, scorer=args.diag_scorer, scorers=diag_scorers,
+        stream=stream, rows_by_id=rows_by_id,
+        gold_rid_by_cluster=gold_rid_by_cluster, gold_label_by_cluster=gold_label_by_cluster,
+        target_fpr=float(args.target_fpr), top_k=int(args.top_k), batch_size=int(args.batch_size),
+        gate_min_train_h0=int(args.min_train_h0), gate_min_train_h1=int(args.min_train_h1),
+        gate_min_calib_h0=int(args.min_calib_h0), gate_min_calib_h1=int(args.min_calib_h1),
+        parallelism=int(args.parallelism), persistence=bool(args.persist),
+        state_dir=out_dir / "state", logger=logger, progress_every=int(args.progress_every),
+    )
+
+    metrics = aggregate_anchor_diagnostics(records)
+    config = {
+        "npz": str(args.npz), "output_dir": str(out_dir), "diag_scorer": args.diag_scorer,
+        "scorers": scorers, "seed": args.seed, "target_fpr": args.target_fpr,
+        "cache_universe": len(rows), "stream_length": len(stream), "top_k": args.top_k,
+        "selection": selection_diag.get("mode"), "max_requests": args.max_requests,
+        "min_train_h0": args.min_train_h0, "min_train_h1": args.min_train_h1,
+        "min_calib_h0": args.min_calib_h0, "min_calib_h1": args.min_calib_h1,
+        "trained": final_policy["trained"], "calibrated": final_policy["calibrated"],
+        "final_threshold": final_policy["threshold"],
+        "label_distribution_selected": dist,
+    }
+    write_anchor_diagnostics(out_dir, records, metrics, config)
+
+    rc, rt = metrics["raw_counts"], metrics["rates"]
+    logger.info("=== ANCHOR DIAGNOSTIC RESULT ===")
+    logger.info("gold_availability=%s top1_gold=%s topk_recall=%s",
+                _rate_str(rt["gold_anchor_cache_availability_rate"]),
+                _rate_str(rt["top1_gold_match_rate"]), _rate_str(rt["topk_gold_recall"]))
+    logger.info("active_tp=%d active_fp=%d active_precision=%s active_fp_rate=%s",
+                rc["active_tp"], rc["active_fp"],
+                _rate_str(rt["active_precision"]), _rate_str(rt["active_fp_rate"]))
+    logger.info("scorer_tpr_given_gold_anchor=%s  dominant_active_fp_bucket=%s",
+                _rate_str(rt["scorer_tpr_given_gold_anchor"]), metrics["dominant_active_fp_bucket"])
+    logger.info("verdict: %s", _anchor_verdict(metrics))
+    logger.info("artifacts -> %s", str(out_dir.resolve()))
+    return {"output_dir": str(out_dir), "metrics": metrics, "config": config}
+
+
 # ── artifact writers ───────────────────────────────────────────────────────
 
 _MINIMAL_FIELDS = [
@@ -1036,6 +1732,15 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--mode", choices=["compare", "retrieved_anchor_diagnostics"], default="compare",
+                   help="compare (default): the cosine-vs-ensemble online replay. "
+                        "retrieved_anchor_diagnostics: audit how often real online retrieval serves the gold "
+                        "NP anchor (writes anchor_retrieval_diagnostics.csv / retrieved_anchor_metrics.json / "
+                        "retrieved_anchor_diagnostics.md).")
+    p.add_argument("--retrieved-anchor-diagnostics", dest="retrieved_anchor_diagnostics", action="store_true",
+                   help="Convenience alias for --mode retrieved_anchor_diagnostics.")
+    p.add_argument("--diag-scorer", choices=["cosine", "ensemble"], default="ensemble",
+                   help="retrieved_anchor_diagnostics: which single online system to replay/audit.")
     p.add_argument("--npz", default=str(ROOT.parent / "data" / "h1h0_final.npz"))
     p.add_argument("--output-dir", default=None, help="Default: timestamped experiments/ dir.")
     p.add_argument("--query-field", default="text")
@@ -1082,8 +1787,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "retrieved_anchor_diagnostics", False):
+        args.mode = "retrieved_anchor_diagnostics"
     try:
-        run_experiment(args)
+        if args.mode == "retrieved_anchor_diagnostics":
+            run_retrieved_anchor_diagnostics(args)
+        else:
+            run_experiment(args)
     except Exception as exc:
         print(f"online_replay_h1h0_final.py failed: {exc}", file=sys.stderr)
         raise
