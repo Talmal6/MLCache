@@ -355,7 +355,13 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 request.embedding,
                 candidate.embedding,
             )
-            score = feedback_score if rank == 1 and feedback_score is not None else snapshot.scorer.score(features)
+            score = (
+                feedback_score
+                if rank == 1 and feedback_score is not None
+                else self._safe_score(snapshot.scorer, features)
+            )
+            if score is None:
+                continue
             accepted = self._predict_score(score, snapshot.threshold, snapshot.tie_mode)
             scored.append(
                 {

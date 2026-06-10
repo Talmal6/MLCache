@@ -512,6 +512,127 @@ class FreezeTests(unittest.TestCase):
                 self.assertTrue(response.policy.frozen)
 
 
+class AutoStopConvergenceTests(unittest.TestCase):
+    """Spec: training stops automatically once the windowed stopping controller
+    converges, and the `min_monitor_*` gate can block that auto-stop when the
+    monitor buckets can never reach the configured size.
+    """
+
+    def test_convergence_auto_freezes_and_halts_training(self) -> None:
+        from mlcache import OnlineStoppingConfig
+
+        # A permissive controller: any two filled-window observations with both
+        # monitor buckets non-empty count as converged (huge eps, huge fpr
+        # margin), so the system auto-freezes shortly after it calibrates.
+        stopping = OnlineStoppingConfig(
+            window=2,
+            patience=1,
+            eps_tpr=1.0,
+            eps_fpr=1.0,
+            eps_tau=1.0,
+            fpr_margin=1.0,
+            min_monitor_h0=1,
+            min_monitor_h1=1,
+        )
+        with tempfile.TemporaryDirectory(prefix="scs-autostop-") as tmp:
+            prompts = _topic_prompts(500)
+            system = _build_system(
+                tmp, stream=prompts, scorer="cosine", scorers=None, stopping_config=stopping
+            )
+            froze_at: int | None = None
+            for index, prompt in enumerate(prompts, start=1):
+                system.handle(prompt)
+                if index % system.batch_size == 0:
+                    system._maybe_check_stopping()
+                if froze_at is None and system.frozen:
+                    froze_at = index
+                    break
+
+            self.assertIsNotNone(froze_at, "system should auto-freeze on convergence")
+            self.assertTrue(system.frozen)
+            self.assertTrue(system.policy.calibrated)
+            report = system.report()
+            self.assertFalse(system.cache.runtime.oracle.auto_refit)
+            self.assertIn("converged", str(report["freeze_reason"]))
+
+            # After the auto-freeze, training/calibration must not advance.
+            before = system.report()
+            for prompt in _topic_prompts(120):
+                system.handle(prompt)
+            after = system.report()
+            self.assertEqual(before["threshold_version"], after["threshold_version"])
+            self.assertEqual(before["scorer_version"], after["scorer_version"])
+            self.assertEqual(before["threshold"], after["threshold"])
+
+    def test_unreachable_min_monitor_h1_never_auto_freezes(self) -> None:
+        """Regression for the observed pathology: when `min_monitor_h1` exceeds
+        the H1 the stream can put in the calibration bucket, the controller is
+        stuck on `insufficient_monitor_data` and never converges, so training
+        churns forever. The system must stay unfrozen (calibrated, but never
+        auto-stopped) — which is the signal that the gate, not the data, is the
+        blocker.
+        """
+        from mlcache import OnlineStoppingConfig
+
+        stopping = OnlineStoppingConfig(
+            window=2, patience=1, eps_tpr=1.0, eps_fpr=1.0, eps_tau=1.0, fpr_margin=1.0,
+            min_monitor_h0=1, min_monitor_h1=10_000,
+        )
+        with tempfile.TemporaryDirectory(prefix="scs-autostop-blocked-") as tmp:
+            prompts = _topic_prompts(500)
+            system = _build_system(
+                tmp, stream=prompts, scorer="cosine", scorers=None, stopping_config=stopping
+            )
+            for index, prompt in enumerate(prompts, start=1):
+                system.handle(prompt)
+                if index % system.batch_size == 0:
+                    system._maybe_check_stopping()
+
+            self.assertTrue(system.policy.calibrated, "fixture must still calibrate")
+            self.assertFalse(system.frozen, "unreachable monitor gate must block auto-stop")
+            self.assertTrue(system.cache.runtime.oracle.auto_refit)
+
+    def test_check_stopping_is_a_noop_once_frozen(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scs-autostop-noop-") as tmp:
+            system = _build_system(tmp)
+            system.freeze(reason="manual")
+            updates_before = system.report()["stopping_updates_observed"]
+            # Even after streaming, a frozen system must not observe more
+            # stopping updates (the controller is bypassed).
+            for prompt in _topic_prompts(60):
+                system.handle(prompt)
+                system._maybe_check_stopping()
+            self.assertEqual(system.report()["stopping_updates_observed"], updates_before)
+
+
+class ColdEnsembleScoringTests(unittest.TestCase):
+    """Regression: a cold (unfit) multi-member ensemble must MISS, never crash.
+
+    The cold `EnsembleScorer` wraps sub-scorers (LDA/PCA/XGBoost/MLP) that raise
+    `fit() must be called before score()` until trained. The oracle's per-rank
+    scoring path must route through `_safe_score` so an unfit scorer yields a
+    clean MISS (no semantic hit) instead of propagating the exception out of
+    `handle()`.
+    """
+
+    def test_cold_full_ensemble_misses_instead_of_raising(self) -> None:
+        scorers = ["cosine", "lda", "pca_whitened_cosine"]
+        try:
+            import sklearn  # noqa: F401
+        except ImportError:
+            self.skipTest("sklearn not installed")
+
+        with tempfile.TemporaryDirectory(prefix="scs-cold-ensemble-") as tmp:
+            system = _build_system(tmp, scorer="ensemble", scorers=scorers)
+            # First few requests retrieve previously-cached neighbours that the
+            # cold ensemble cannot score; this must not raise.
+            responses = [system.handle(prompt) for prompt in _topic_prompts(8)]
+
+            self.assertTrue(all(r.source == "llm" for r in responses))
+            self.assertFalse(system.policy.trained)
+            self.assertIsNone(system.cache.runtime.oracle._fit_exception)
+
+
 class ParallelismTests(unittest.TestCase):
     """Spec: judge calls across top-k candidates must be parallelized, and the
     serving/scoring path must not be blocked by them."""

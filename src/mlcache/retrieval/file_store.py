@@ -23,7 +23,7 @@ class FileVectorStore(InMemoryVectorStore):
             raise ValueError("similarity must be 'cosine' or 'dot'")
         for item in data.get("records", ()):
             result = self._decode_result(item)
-            self._entries[result.cache_key] = result
+            self._add_result(result)
 
     def upsert(self, entry: CacheEntry) -> None:
         super().upsert(entry)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Sequence
@@ -164,45 +165,65 @@ class InMemorySplitJudgeTrainingStore(SplitJudgeTrainingStore):
         self._h1_train: list[JudgedPairExample] = []
         self._h0_calibration: list[JudgedPairExample] = []
         self._h1_calibration: list[JudgedPairExample] = []
+        self._h0_train_keys: list[tuple] = []
+        self._h1_train_keys: list[tuple] = []
+        self._h0_calibration_keys: list[tuple] = []
+        self._h1_calibration_keys: list[tuple] = []
+        self._train_keys: Counter[tuple] = Counter()
+        self._calibration_keys: Counter[tuple] = Counter()
 
     def add_train(self, example: JudgedPairExample) -> None:
         if example.decision.label == JudgeLabel.UNCERTAIN:
             return
-        if self._is_in_split(example, split="calibration"):
+        key = self._example_key(example)
+        if key in self._calibration_keys:
             return
         if example.decision.label == JudgeLabel.REUSABLE:
             self._add_to_bucket(
                 bucket=self._h1_train,
+                bucket_keys=self._h1_train_keys,
+                split_keys=self._train_keys,
                 capacity=self.max_h1_train,
                 label=JudgeLabel.REUSABLE,
                 example=example,
+                key=key,
             )
         else:
             self._add_to_bucket(
                 bucket=self._h0_train,
+                bucket_keys=self._h0_train_keys,
+                split_keys=self._train_keys,
                 capacity=self.max_h0_train,
                 label=JudgeLabel.NOT_REUSABLE,
                 example=example,
+                key=key,
             )
 
     def add_calibration(self, example: JudgedPairExample) -> None:
         if example.decision.label == JudgeLabel.UNCERTAIN:
             return
-        if self._is_in_split(example, split="train"):
+        key = self._example_key(example)
+        if key in self._train_keys:
             return
         if example.decision.label == JudgeLabel.REUSABLE:
             self._add_to_bucket(
                 bucket=self._h1_calibration,
+                bucket_keys=self._h1_calibration_keys,
+                split_keys=self._calibration_keys,
                 capacity=self.max_h1_calibration,
                 label=JudgeLabel.REUSABLE,
                 example=example,
+                key=key,
             )
         else:
             self._add_to_bucket(
                 bucket=self._h0_calibration,
+                bucket_keys=self._h0_calibration_keys,
+                split_keys=self._calibration_keys,
                 capacity=self.max_h0_calibration,
                 label=JudgeLabel.NOT_REUSABLE,
                 example=example,
+                key=key,
             )
 
     def h0(self) -> tuple[JudgedPairExample, ...]:
@@ -227,9 +248,12 @@ class InMemorySplitJudgeTrainingStore(SplitJudgeTrainingStore):
         self,
         *,
         bucket: list[JudgedPairExample],
+        bucket_keys: list[tuple],
+        split_keys: Counter[tuple],
         capacity: int,
         label: JudgeLabel,
         example: JudgedPairExample,
+        key: tuple,
     ) -> None:
         if len(bucket) >= capacity:
             idx = self.eviction_policy.choose_eviction_index(
@@ -240,16 +264,13 @@ class InMemorySplitJudgeTrainingStore(SplitJudgeTrainingStore):
             if idx < 0 or idx >= len(bucket):
                 raise IndexError(f"eviction index out of range: {idx}")
             bucket.pop(idx)
+            evicted_key = bucket_keys.pop(idx)
+            split_keys[evicted_key] -= 1
+            if split_keys[evicted_key] <= 0:
+                del split_keys[evicted_key]
         bucket.append(example)
-
-    def _is_in_split(self, example: JudgedPairExample, *, split: str) -> bool:
-        key = self._example_key(example)
-        buckets = (
-            (self._h0_train, self._h1_train)
-            if split == "train"
-            else (self._h0_calibration, self._h1_calibration)
-        )
-        return any(self._example_key(existing) == key for bucket in buckets for existing in bucket)
+        bucket_keys.append(key)
+        split_keys[key] += 1
 
     @staticmethod
     def _example_key(example: JudgedPairExample) -> tuple[str, str | None, tuple[float, ...], str]:
