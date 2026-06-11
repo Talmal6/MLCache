@@ -56,6 +56,8 @@ def rec(**overrides) -> exp.AnchorDiagRecord:
         threshold=0.5,
         accepted_gold_anchor=True,
         served_hit=True,
+        evaluated_h0_candidate_count=0,
+        accepted_h0_candidate_count=0,
     )
     base.update(overrides)
     return exp.AnchorDiagRecord(**base)

@@ -49,7 +49,7 @@ from compare_cosine_vs_ensemble import (  # noqa: E402
     encode_prompt,
     load_rows,
 )
-from mlcache import JudgeLabel, JudgeRequest  # noqa: E402
+from mlcache import JudgeLabel, JudgeRequest, MockLLM, SemanticCacheSystem  # noqa: E402
 from mlcache.semantic_types import CacheKey, Query  # noqa: E402
 
 
@@ -359,6 +359,90 @@ def test_active_decision_audit_written_with_false_positive_rows(tiny_npz, tmp_pa
     for r in audit:
         assert r["oracle_label"] in ("H0", "H1", "UNCERTAIN", "UNKNOWN")
         assert r["predicted_decision"] == "HIT"
+
+
+# ── 8. warm-up freeze guard ─────────────────────────────────────────────────
+
+def test_assert_not_frozen_before_measurement_raises_when_frozen(tmp_path):
+    system = SemanticCacheSystem(
+        llm=MockLLM(response_template="answer: {prompt}"),
+        stream=None, scorer="cosine", root_dir=tmp_path / "frozen", persistence=False,
+    )
+    system.freeze(reason="convergence_during_warmup")
+
+    with pytest.raises(RuntimeError, match="frozen.*convergence_during_warmup"):
+        exp._assert_not_frozen_before_measurement(system, "cosine")
+
+
+def test_assert_not_frozen_before_measurement_passes_when_not_frozen(tmp_path):
+    system = SemanticCacheSystem(
+        llm=MockLLM(response_template="answer: {prompt}"),
+        stream=None, scorer="cosine", root_dir=tmp_path / "not_frozen", persistence=False,
+    )
+    exp._assert_not_frozen_before_measurement(system, "cosine")  # must not raise
+
+
+# ── 9. anchor recovery guard against stale key_to_row entries ──────────────
+
+def test_recover_audit_anchor_succeeds_for_fresh_entry(tmp_path):
+    system = SemanticCacheSystem(
+        llm=MockLLM(response_template="answer: {prompt}"),
+        stream=None, scorer="cosine", root_dir=tmp_path / "fresh", persistence=False,
+    )
+    response = system.handle("hello world")
+    assert response.source == "llm"
+    cache_key = response.cache_key
+    key_to_row = {cache_key: 7}
+    key_to_prompt = {cache_key: "hello world"}
+
+    anchor_row_id, failed = exp._recover_audit_anchor(system, cache_key, key_to_row, key_to_prompt)
+    assert anchor_row_id == 7
+    assert failed is False
+
+
+def test_recover_audit_anchor_fails_after_eviction(tmp_path):
+    system = SemanticCacheSystem(
+        llm=MockLLM(response_template="answer: {prompt}"),
+        stream=None, scorer="cosine", root_dir=tmp_path / "evicted", persistence=False,
+    )
+    response = system.handle("hello world")
+    cache_key = response.cache_key
+    key_to_row = {cache_key: 7}
+    key_to_prompt = {cache_key: "hello world"}
+
+    # Simulate the production eviction path (runtime.py invalidates a stale
+    # query-level candidate via oracle.remove).
+    system.cache.runtime.oracle.remove(cache_key)
+
+    anchor_row_id, failed = exp._recover_audit_anchor(system, cache_key, key_to_row, key_to_prompt)
+    assert anchor_row_id is None
+    assert failed is True
+
+
+def test_recover_audit_anchor_fails_on_prompt_mismatch(tmp_path):
+    system = SemanticCacheSystem(
+        llm=MockLLM(response_template="answer: {prompt}"),
+        stream=None, scorer="cosine", root_dir=tmp_path / "mismatch", persistence=False,
+    )
+    response = system.handle("hello world")
+    cache_key = response.cache_key
+    key_to_row = {cache_key: 7}
+    # Recorded witness no longer matches what's actually stored under cache_key.
+    key_to_prompt = {cache_key: "a different prompt"}
+
+    anchor_row_id, failed = exp._recover_audit_anchor(system, cache_key, key_to_row, key_to_prompt)
+    assert anchor_row_id is None
+    assert failed is True
+
+
+def test_recover_audit_anchor_fails_when_key_unknown(tmp_path):
+    system = SemanticCacheSystem(
+        llm=MockLLM(response_template="answer: {prompt}"),
+        stream=None, scorer="cosine", root_dir=tmp_path / "unknown", persistence=False,
+    )
+    anchor_row_id, failed = exp._recover_audit_anchor(system, "nonexistent-key", {}, {})
+    assert anchor_row_id is None
+    assert failed is True
 
 
 if __name__ == "__main__":

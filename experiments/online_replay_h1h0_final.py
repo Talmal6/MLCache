@@ -382,6 +382,54 @@ def _write_through_row(system: SemanticCacheSystem, row: DatasetRow) -> str:
     return str(cache_key)
 
 
+def _assert_not_frozen_before_measurement(system, method: str) -> None:
+    report = system.report()
+    if report["frozen"]:
+        raise RuntimeError(
+            f"[{method}] policy is frozen (freeze_reason={report['freeze_reason']!r}) before measured "
+            "replay began. Convergence stopping during warm-up must not freeze the policy that the "
+            "measured replay runs on."
+        )
+
+
+def _recover_audit_anchor(
+    system: SemanticCacheSystem,
+    cache_key: str,
+    key_to_row: dict[str, int],
+    key_to_prompt: dict[str, str],
+) -> tuple[int | None, bool]:
+    """Resolve the row originally written under `cache_key` for audit labeling.
+
+    `key_to_row` is append-only, so a HIT's `cache_key` may no longer point at
+    the entry that was last recorded for it (e.g. evicted via
+    `oracle.remove`). Verify against the vector store's current entry for
+    `cache_key` -- if it's missing or its prompt no longer matches what was
+    recorded, recovery has failed.
+    """
+    anchor_row_id = key_to_row.get(cache_key)
+    if anchor_row_id is None:
+        return None, True
+    current = system.cache.runtime.oracle.vector_store.get(cache_key)
+    if current is None or current.query != key_to_prompt.get(cache_key):
+        return None, True
+    return anchor_row_id, False
+
+
+def _force_refit_after_warmup(system, oracle, logger, method: str, max_attempts: int = 5, timeout: int = 120) -> None:
+    for attempt in range(max_attempts):
+        try:
+            oracle.wait_for_fit(timeout=timeout)
+        except Exception as exc:
+            logger.warning("[%s] warm-up: wait_for_fit raised: %s", method, exc)
+            break
+        if snapshot_policy(system)["trained"]:
+            break
+        decision = oracle._maybe_auto_refit(current_threshold=oracle._threshold)
+        if decision is None or decision.action != RefitAction.REFIT_SCORER:
+            break
+        logger.info("[%s] warm-up: retry refit attempt %d (%s)", method, attempt + 1, decision.reason)
+
+
 # ── one system replay with full active-decision audit ──────────────────────
 
 def run_one_system(
@@ -456,6 +504,7 @@ def run_one_system(
 
     # Per-request bookkeeping.
     key_to_row: dict[str, int] = {}       # exact anchor recovery: cache_key -> row_id
+    key_to_prompt: dict[str, str] = {}    # prompt witness: cache_key -> prompt last written
 
     if warmup_stream:
         logger.info("[%s] warm-up: replaying %d requests (scorer=%s)", method, len(warmup_stream),
@@ -466,14 +515,15 @@ def run_one_system(
             if response.source == "llm":
                 if response.cache_key is not None:
                     key_to_row[response.cache_key] = row.row_id
+                    key_to_prompt[response.cache_key] = row.prompt
             elif shared_cache:  # HIT: force the row in so caches stay identical
-                key_to_row[_write_through_row(system, row)] = row.row_id
+                k = _write_through_row(system, row)
+                key_to_row[k] = row.row_id
+                key_to_prompt[k] = row.prompt
             recorder.resolve_request(
                 idx, source=response.source,
                 accepted_key=response.cache_key if response.source == "cache" else None,
             )
-            if idx % max(1, batch_size) == 0:
-                system._maybe_check_stopping()
             if progress_every > 0 and idx % progress_every == 0:
                 wp = snapshot_policy(system)
                 wc = snapshot_training_counts(system)
@@ -491,18 +541,7 @@ def run_one_system(
         # snapshot too small to pass the activation gate, even though enough
         # data has accumulated by the time the warm-up stream is exhausted.
         oracle = system.cache.runtime.oracle
-        for attempt in range(5):
-            try:
-                oracle.wait_for_fit(timeout=120)
-            except Exception as exc:
-                logger.warning("[%s] warm-up: wait_for_fit raised: %s", method, exc)
-                break
-            if snapshot_policy(system)["trained"]:
-                break
-            decision = oracle._maybe_auto_refit(current_threshold=oracle._threshold)
-            if decision is None or decision.action != RefitAction.REFIT_SCORER:
-                break
-            logger.info("[%s] warm-up: retry refit attempt %d (%s)", method, attempt + 1, decision.reason)
+        _force_refit_after_warmup(system, oracle, logger, method)
 
         wp = snapshot_policy(system)
         wc = snapshot_training_counts(system)
@@ -514,11 +553,14 @@ def run_one_system(
         )
         recorder.reset()
 
+    _assert_not_frozen_before_measurement(system, method)
+
     minimal_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = []
     activation_index: int | None = None
     first_hit_at: int | None = None
     first_calibrated_at: int | None = None
+    audit_anchor_recovery_failures = 0
 
     started = time.time()
     logger.info("[%s] replaying %d requests (scorer=%s)", method, len(stream),
@@ -533,6 +575,7 @@ def run_one_system(
             # New cache entry written through on a MISS.
             if response.cache_key is not None:
                 key_to_row[response.cache_key] = row.row_id
+                key_to_prompt[response.cache_key] = row.prompt
         else:  # cache HIT -> exact accept/reject join
             if first_hit_at is None:
                 first_hit_at = idx
@@ -540,7 +583,9 @@ def run_one_system(
             # caches hold the identical set of rows and cosine-NN retrieves the
             # same candidates for both. (No-op for the default policy-built cache.)
             if shared_cache:
-                key_to_row[_write_through_row(system, row)] = row.row_id
+                k = _write_through_row(system, row)
+                key_to_row[k] = row.row_id
+                key_to_prompt[k] = row.prompt
         recorder.resolve_request(
             idx, source=response.source,
             accepted_key=response.cache_key if response.source == "cache" else None,
@@ -569,10 +614,14 @@ def run_one_system(
 
         # Active-decision audit: every cache HIT (the active accept decisions).
         if response.source == "cache":
-            anchor_row_id = key_to_row.get(response.cache_key)
+            anchor_row_id, anchor_recovery_failed = _recover_audit_anchor(
+                system, response.cache_key, key_to_row, key_to_prompt
+            )
+            if anchor_recovery_failed:
+                audit_anchor_recovery_failures += 1
             anchor = rows_by_id.get(anchor_row_id) if anchor_row_id is not None else None
-            oracle = reuse_label(row, anchor) if anchor is not None else "UNKNOWN"
-            is_fp = oracle == "H0"
+            oracle_label = reuse_label(row, anchor) if anchor is not None else "UNKNOWN"
+            is_fp = oracle_label == "H0"
             audit_rows.append({
                 "request_index": idx,
                 "query_row_id": row.row_id,
@@ -584,12 +633,13 @@ def run_one_system(
                 "score": response.score,
                 "threshold": response.threshold,
                 "predicted_decision": "HIT",
-                "oracle_label": oracle,
+                "oracle_label": oracle_label,
                 "is_false_positive": bool(is_fp),
                 "scorer_state": scorer_state(policy, method=method),
                 "cache_size": len(key_to_row),
                 "candidate_rank": 1,  # served candidate is the top accepted; deeper rank not exposed
                 "post_activation": bool(activation_index is not None and idx >= activation_index),
+                "anchor_recovery_failed": bool(anchor_recovery_failed),
             })
 
         if idx % max(1, batch_size) == 0:
@@ -615,6 +665,15 @@ def run_one_system(
     hits = sum(1 for r in minimal_rows if r["source"] == "cache")
     misses = sum(1 for r in minimal_rows if r["source"] == "llm")
 
+    if audit_anchor_recovery_failures > 0:
+        logger.warning(
+            "[%s] %d/%d active-hit audit anchors could not be recovered "
+            "(stale key_to_row entry; fraction=%s). These rows are reported "
+            "with oracle_label=UNKNOWN and excluded from active TP/FP.",
+            method, audit_anchor_recovery_failures, hits,
+            _fmt(safe_rate(audit_anchor_recovery_failures, hits), 4),
+        )
+
     # Active-hit (online decision) view of TP/FP.
     active = [a for a in audit_rows if a["oracle_label"] in ("H0", "H1")]
     active_tp = sum(1 for a in active if a["oracle_label"] == "H1")
@@ -636,7 +695,9 @@ def run_one_system(
         "hits": hits,
         "misses": misses,
         "hit_rate": safe_rate(hits, len(stream)),
-        "first_hit_at_request": first_hit_at,
+        # Index is relative to the start of the measured (post-warmup) replay;
+        # see "warmup_requests" for the number of requests excluded.
+        "first_hit_after_warmup_at_request": first_hit_at,
         "first_calibrated_at_request": first_calibrated_at,
         "activation_request_index": activation_index,
         "threshold": final_policy["threshold"],
@@ -670,6 +731,7 @@ def run_one_system(
         "post_activation_false_positives": post_fp,
         "post_activation_true_positives": post_tp,
         "post_activation_fp_rate": safe_rate(post_fp, post_tp + post_fp),
+        "audit_anchor_recovery_failures": audit_anchor_recovery_failures,
         "gate_diagnostics": gate_diag.__dict__,
         "calibration_vs_active": calib_diag,
         "activation_status": _activation_status(
@@ -918,6 +980,8 @@ class AnchorDiagRecord:
     threshold: float | None
     accepted_gold_anchor: bool     # FORCED: would the scorer accept the gold pair
     served_hit: bool               # the real online serving decision (HIT)
+    evaluated_h0_candidate_count: int  # # of top-k candidates this request judged H0
+    accepted_h0_candidate_count: int   # of those, # the active policy would accept
 
 
 def _diag_top1_is_gold(r: AnchorDiagRecord) -> bool:
@@ -1025,6 +1089,12 @@ def aggregate_anchor_diagnostics(records: list[AnchorDiagRecord]) -> dict[str, A
     active_unjudged = sum(1 for c, _ in classes if c == "unjudged")
     active_judged_hits = active_tp + active_fp  # == judged served hits, by construction
 
+    # Candidate-level (top-k) view: every H0-judged candidate seen during the
+    # measured replay (after activation), and how many of those the active
+    # policy (current scorer + threshold) would accept.
+    online_candidate_evaluated_h0 = sum(r.evaluated_h0_candidate_count for r in records)
+    online_candidate_accepted_h0 = sum(r.accepted_h0_candidate_count for r in records)
+
     raw_counts = {
         "total_requests": total,
         "gold_anchor_available_count": gold_available,
@@ -1045,6 +1115,8 @@ def aggregate_anchor_diagnostics(records: list[AnchorDiagRecord]) -> dict[str, A
         "active_fp": active_fp,
         "served_hits": served_hits,
         "misses": misses,
+        "online_candidate_evaluated_h0_count": online_candidate_evaluated_h0,
+        "online_candidate_accepted_h0_count": online_candidate_accepted_h0,
     }
 
     rates = {
@@ -1056,6 +1128,7 @@ def aggregate_anchor_diagnostics(records: list[AnchorDiagRecord]) -> dict[str, A
         "active_precision": _rate(active_tp, active_tp + active_fp),
         "active_fp_rate": _rate(active_fp, active_judged_hits),
         "active_hit_rate": _rate(served_hits, total),
+        "online_candidate_empirical_fpr": _rate(online_candidate_accepted_h0, online_candidate_evaluated_h0),
     }
 
     # Attribute each ACTIVE FALSE POSITIVE to a single bucket so the dominant
@@ -1107,6 +1180,7 @@ _ANCHOR_DIAG_FIELDS = [
     "score_gold_anchor", "score_retrieved_anchor", "threshold",
     "accepted_gold_anchor", "accepted_retrieved_anchor",
     "served_hit", "served_is_tp", "served_is_fp", "served_unjudged", "reason_if_unjudged",
+    "evaluated_h0_candidate_count", "accepted_h0_candidate_count",
 ]
 
 
@@ -1141,6 +1215,8 @@ def anchor_record_to_csv_row(r: AnchorDiagRecord) -> dict[str, Any]:
         "served_is_fp": cls == "fp",
         "served_unjudged": cls == "unjudged",
         "reason_if_unjudged": reason or "",
+        "evaluated_h0_candidate_count": r.evaluated_h0_candidate_count,
+        "accepted_h0_candidate_count": r.accepted_h0_candidate_count,
     }
 
 
@@ -1281,8 +1357,6 @@ def replay_with_anchor_capture(
                 widx, source=response.source,
                 accepted_key=response.cache_key if response.source == "cache" else None,
             )
-            if widx % max(1, batch_size) == 0:
-                system._maybe_check_stopping()
             if progress_every > 0 and widx % progress_every == 0:
                 wp = snapshot_policy(system)
                 logger.info("[%s][warm-up %d/%d] trained=%s calibrated=%s thr=%s",
@@ -1292,18 +1366,7 @@ def replay_with_anchor_capture(
         # Force/retry the refit exactly like the old online comparison: a fit
         # triggered mid-warm-up may have been built from a snapshot too small to
         # pass the activation gate even though enough data has since accumulated.
-        for attempt in range(5):
-            try:
-                oracle.wait_for_fit(timeout=120)
-            except Exception as exc:
-                logger.warning("[%s] warm-up: wait_for_fit raised: %s", method, exc)
-                break
-            if snapshot_policy(system)["trained"]:
-                break
-            decision = oracle._maybe_auto_refit(current_threshold=oracle._threshold)
-            if decision is None or decision.action != RefitAction.REFIT_SCORER:
-                break
-            logger.info("[%s] warm-up: retry refit attempt %d (%s)", method, attempt + 1, decision.reason)
+        _force_refit_after_warmup(system, oracle, logger, method)
 
         wp = snapshot_policy(system)
         wc = snapshot_training_counts(system)
@@ -1364,6 +1427,8 @@ def replay_with_anchor_capture(
                 "cold (threshold=None). Provide --warmup-requests so the scorer activates before measurement."
             )
 
+    _assert_not_frozen_before_measurement(system, method)
+
     logger.info("[%s] anchor-diagnostic replay of %d MEASURED requests (scorer=%s, top_k=%d)",
                 method, len(stream), ",".join(scorers) if scorers else scorer, top_k)
     started = time.time()
@@ -1394,6 +1459,25 @@ def replay_with_anchor_capture(
             feats_g = oracle.feature_builder.build(query_emb_t, _emb_tuple(gold_row))
             sg = oracle._safe_score(pre_scorer, feats_g)
             score_gold = None if sg is None else float(sg)
+
+        # ---- candidate-level FPR probe: every top-k candidate the oracle judges
+        # H0, and whether the active policy (current scorer + threshold) would
+        # accept it ----
+        evaluated_h0_candidates = 0
+        accepted_h0_candidates = 0
+        for cand in candidates:
+            cand_rid = key_to_row.get(str(cand.cache_key))
+            cand_row = rows_by_id.get(cand_rid) if cand_rid is not None else None
+            if cand_row is None:
+                continue
+            if reuse_label(row, cand_row) != "H0":
+                continue
+            evaluated_h0_candidates += 1
+            feats_c = oracle.feature_builder.build(query_emb_t, _emb_tuple(cand_row))
+            sc = oracle._safe_score(pre_scorer, feats_c)
+            score_c = None if sc is None else float(sc)
+            if pre_threshold is not None and score_c is not None and score_c >= float(pre_threshold):
+                accepted_h0_candidates += 1
 
         # ---- serve through the REAL online path (retrieval + scoring + learn) ----
         response = system.handle(prompt)
@@ -1452,6 +1536,8 @@ def replay_with_anchor_capture(
             threshold=threshold,
             accepted_gold_anchor=accepted_gold_forced,
             served_hit=served_hit,
+            evaluated_h0_candidate_count=evaluated_h0_candidates,
+            accepted_h0_candidate_count=accepted_h0_candidates,
         ))
 
         if idx % max(1, batch_size) == 0:
@@ -1706,6 +1792,9 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
                 _rate_str(rt["active_precision"]), _rate_str(rt["active_fp_rate"]))
     logger.info("scorer_tpr_given_gold_anchor=%s  dominant_active_fp_bucket=%s",
                 _rate_str(rt["scorer_tpr_given_gold_anchor"]), metrics["dominant_active_fp_bucket"])
+    logger.info("online_candidate_empirical_fpr=%s (accepted_h0=%d / evaluated_h0=%d)",
+                _rate_str(rt["online_candidate_empirical_fpr"]),
+                rc["online_candidate_accepted_h0_count"], rc["online_candidate_evaluated_h0_count"])
     logger.info("verdict: %s", _anchor_verdict(metrics))
     logger.info("artifacts -> %s", str(out_dir.resolve()))
     return {"output_dir": str(out_dir), "metrics": metrics, "config": config}
@@ -1721,13 +1810,13 @@ _AUDIT_FIELDS = [
     "method", "request_index", "query_row_id", "query_text", "anchor_row_id",
     "anchor_text", "query_cluster", "anchor_cluster", "score", "threshold",
     "predicted_decision", "oracle_label", "is_false_positive", "scorer_state",
-    "cache_size", "candidate_rank", "post_activation",
+    "cache_size", "candidate_rank", "post_activation", "anchor_recovery_failed",
 ]
 _SUMMARY_CSV_FIELDS = [
     "method", "total_requests", "hits", "misses", "hit_rate",
     "shadow_empirical_fpr", "shadow_tpr", "shadow_precision",
     "active_hits", "active_true_positives", "active_false_positives",
-    "active_fp_rate", "post_activation_fp_rate",
+    "active_fp_rate", "post_activation_fp_rate", "audit_anchor_recovery_failures",
     "threshold", "activation_request_index", "trained", "calibrated",
     "train_h0", "train_h1", "calibration_h0", "calibration_h1",
 ]
@@ -1812,6 +1901,9 @@ def _improvement_verdict(cs: dict[str, Any], es: dict[str, Any]) -> str:
         return "yes: ensemble dominates (>= TPR at <= FPR)"
     if e_tpr > c_tpr and e_fpr > c_fpr:
         return "mixed: ensemble higher TPR but also higher FPR"
+    if e_tpr < c_tpr and e_fpr < c_fpr:
+        return ("mixed: ensemble more conservative than cosine "
+                "(lower TPR and lower FPR)")
     return "no: ensemble does not improve over cosine on this stream"
 
 
