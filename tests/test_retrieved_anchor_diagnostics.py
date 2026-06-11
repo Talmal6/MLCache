@@ -269,5 +269,57 @@ def test_end_to_end_diagnostic_writes_consistent_artifacts(tmp_path):
     assert result["metrics"]["raw_counts"]["total_requests"] == 200
 
 
+@skip_no_sklearn
+def test_ensemble_warm_starts_and_is_active_before_measurement(tmp_path):
+    npz = _make_npz(tmp_path / "tiny.npz")
+    out = tmp_path / "diag_ens"
+    args = exp.parse_args([
+        "--mode", "retrieved_anchor_diagnostics", "--diag-scorer", "ensemble",
+        "--scorers", "cosine,lda", "--npz", str(npz), "--output-dir", str(out),
+        "--warmup-requests", "400", "--max-requests", "120", "--cache-size", "55", "--top-k", "5",
+        "--min-train-h0", "4", "--min-train-h1", "2", "--min-calib-h0", "2",
+        "--min-calib-h1", "1", "--target-fpr", "0.30", "--batch-size", "20",
+        "--progress-every", "1000", "--seed", "42",
+    ])
+    exp.run_retrieved_anchor_diagnostics(args)
+
+    metrics = json.loads((out / "retrieved_anchor_metrics.json").read_text(encoding="utf-8"))
+    wu = metrics["config"]["warmup"]
+    # The ensemble must be active BEFORE the measured phase (item 4).
+    assert wu["activated_before_measurement"] is True
+    assert wu["threshold_after_warmup"] is not None
+    assert wu["scorer_version_after_warmup"] >= 1
+    assert wu["warmup_requests"] == 400
+    assert metrics["config"]["calibrated"] is True
+    assert metrics["config"]["final_threshold"] is not None
+
+    # Warm-up requests must NOT be in the measured records (item 6).
+    with (out / "anchor_retrieval_diagnostics.csv").open(newline="", encoding="utf-8") as f:
+        csv_rows = list(csv.DictReader(f))
+    assert len(csv_rows) == 120
+    assert metrics["raw_counts"]["total_requests"] == 120
+    # Measured request indices start at 1 (item 5).
+    assert min(int(r["request_index"]) for r in csv_rows) == 1
+
+
+@skip_no_sklearn
+def test_ensemble_fails_fast_when_it_cannot_activate(tmp_path):
+    npz = _make_npz(tmp_path / "tiny.npz")
+    out = tmp_path / "diag_fail"
+    # Unreachable H1 train gate -> scorer can never train/calibrate.
+    args = exp.parse_args([
+        "--mode", "retrieved_anchor_diagnostics", "--diag-scorer", "ensemble",
+        "--scorers", "cosine,lda", "--npz", str(npz), "--output-dir", str(out),
+        "--warmup-requests", "120", "--max-requests", "60", "--cache-size", "55", "--top-k", "5",
+        "--min-train-h0", "4", "--min-train-h1", "100000", "--min-calib-h0", "2",
+        "--min-calib-h1", "1", "--target-fpr", "0.30", "--batch-size", "20",
+        "--progress-every", "1000", "--seed", "42",
+    ])
+    with pytest.raises(RuntimeError, match="requires activation"):
+        exp.run_retrieved_anchor_diagnostics(args)
+    # Must fail BEFORE writing a misleading threshold=None diagnostic.
+    assert not (out / "retrieved_anchor_metrics.json").exists()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

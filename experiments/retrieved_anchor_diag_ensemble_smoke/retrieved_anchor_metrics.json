@@ -1,0 +1,114 @@
+{
+  "active_fp_attribution": {
+    "different_cluster_confusion": 25,
+    "gold_anchor_absent": 19,
+    "gold_in_topk_not_selected": 27,
+    "gold_present_not_in_topk": 12,
+    "other": 2,
+    "same_cluster_confusion": 35
+  },
+  "config": {
+    "cache_universe": 4000,
+    "calibrated": true,
+    "diag_scorer": "ensemble",
+    "final_threshold": 0.037883274257183075,
+    "label_distribution_selected": {
+      "0": 3423,
+      "1": 577
+    },
+    "max_requests": 1000,
+    "min_calib_h0": 20,
+    "min_calib_h1": 5,
+    "min_train_h0": 40,
+    "min_train_h1": 10,
+    "npz": "C:/Work/MLCache/data/h1h0_final.npz",
+    "output_dir": "experiments\\retrieved_anchor_diag_ensemble_smoke",
+    "scorers": [
+      "cosine",
+      "lda",
+      "pca_whitened_cosine",
+      "xgboost",
+      "mlp"
+    ],
+    "seed": 42,
+    "selection": "mixed",
+    "stream_length": 1000,
+    "target_fpr": 0.05,
+    "top_k": 5,
+    "trained": true,
+    "warmup": {
+      "activated_before_measurement": true,
+      "scorer_version_after_warmup": 2,
+      "threshold_after_warmup": 0.03747309744358063,
+      "warmup_calib_h0": 2310,
+      "warmup_calib_h1": 57,
+      "warmup_requests": 4000,
+      "warmup_train_h0": 12216,
+      "warmup_train_h1": 807
+    }
+  },
+  "dominant_active_fp_bucket": "gold_in_topk_not_selected",
+  "rates": {
+    "active_fp_rate": {
+      "denominator": 198,
+      "numerator": 60,
+      "value": 0.30303030303030304
+    },
+    "active_hit_rate": {
+      "denominator": 1000,
+      "numerator": 584,
+      "value": 0.584
+    },
+    "active_precision": {
+      "denominator": 198,
+      "numerator": 138,
+      "value": 0.696969696969697
+    },
+    "gold_anchor_cache_availability_rate": {
+      "denominator": 1000,
+      "numerator": 779,
+      "value": 0.779
+    },
+    "scorer_tpr_given_gold_anchor": {
+      "denominator": 131,
+      "numerator": 111,
+      "value": 0.8473282442748091
+    },
+    "top1_gold_match_rate": {
+      "denominator": 1000,
+      "numerator": 109,
+      "value": 0.109
+    },
+    "topk_gold_recall": {
+      "denominator": 1000,
+      "numerator": 557,
+      "value": 0.557
+    },
+    "wrong_anchor_accept_rate": {
+      "denominator": 549,
+      "numerator": 179,
+      "value": 0.32604735883424407
+    }
+  },
+  "raw_counts": {
+    "accepted_gold_anchor": 111,
+    "accepted_wrong_anchor": 179,
+    "active_fp": 60,
+    "active_judged_hits": 198,
+    "active_tp": 138,
+    "active_unjudged_hits": 386,
+    "different_cluster_wrong_anchor": 25,
+    "gold_anchor_available_count": 779,
+    "gold_anchor_missing_count": 221,
+    "misses": 416,
+    "rejected_gold_anchor": 20,
+    "rejected_wrong_anchor": 370,
+    "same_cluster_wrong_anchor": 154,
+    "served_hits": 584,
+    "top1_is_gold_anchor_count": 109,
+    "top1_wrong_anchor_count": 891,
+    "topk_contains_gold_anchor_count": 557,
+    "topk_misses_gold_anchor_count": 443,
+    "total_requests": 1000
+  }
+}

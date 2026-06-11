@@ -239,6 +239,39 @@ def test_cosine_and_ensemble_share_identical_request_order(tiny_npz, tmp_path):
     assert cos == ens, "both systems must replay the identical request order"
 
 
+@skip_no_sklearn
+def test_shared_cache_makes_both_systems_judge_identical_pairs(tiny_npz, tmp_path):
+    """With --shared-cache, every request writes through even on a HIT, so both
+    caches hold the identical rows -> cosine-NN retrieves the same candidates for
+    both -> both judge the IDENTICAL set of pairs. The judged H1/H0 composition
+    (and thus FP+TN, TP+FN totals) must therefore match exactly across scorers,
+    even though their accept/reject decisions differ."""
+    import json
+    out = tmp_path / "run"
+    args = exp.parse_args([
+        "--npz", str(tiny_npz), "--output-dir", str(out), "--shared-cache",
+        "--scorers", "cosine,lda", "--max-requests", "150", "--cache-size", "55",
+        "--min-train-h0", "4", "--min-train-h1", "2", "--min-calib-h0", "2",
+        "--min-calib-h1", "1", "--target-fpr", "0.25", "--batch-size", "20",
+        "--progress-every", "1000", "--seed", "1",
+    ])
+    exp.run_experiment(args)
+    d = json.loads((out / "summary_metrics.json").read_text(encoding="utf-8"))
+
+    def judged(s):
+        h1 = s["shadow_true_accepts"] + s["shadow_false_rejects"]   # TP + FN
+        h0 = s["shadow_false_accepts"] + s["shadow_true_rejects"]   # FP + TN
+        return h1, h0
+
+    c_h1, c_h0 = judged(d["cosine"])
+    e_h1, e_h0 = judged(d["ensemble"])
+    assert (c_h1, c_h0) == (e_h1, e_h0), (
+        f"shared cache must judge identical pairs: cosine (H1={c_h1},H0={c_h0}) "
+        f"vs ensemble (H1={e_h1},H0={e_h0})"
+    )
+    assert c_h1 + c_h0 > 0
+
+
 # ── 5. activation only after gates satisfied ───────────────────────────────
 
 @skip_no_sklearn

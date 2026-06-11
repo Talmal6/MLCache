@@ -55,6 +55,7 @@ from mlcache import MockLLM, SemanticCacheSystem  # noqa: E402
 from mlcache.policies import ConservativeRefitConfig, ConservativeRefitPolicy  # noqa: E402
 from mlcache.policies.refit import RefitAction  # noqa: E402
 from mlcache.scorers.utils import score_rows_with_scorer  # noqa: E402
+from mlcache.semantic_types import CacheEntry, CacheMetadata, Query, Response  # noqa: E402
 
 # Gold-anchor machinery: the retrieved-anchor diagnostic compares against the
 # SAME centroid-nearest cluster anchor np_compat_pair_eval uses, so we import
@@ -132,19 +133,37 @@ def build_refit_policy(
     min_calib_h0: int,
     min_calib_h1: int,
     target_fpr: float,
+    use_wilson: bool = True,
 ) -> tuple[ConservativeRefitPolicy, GateDiagnostics]:
     """Build a ConservativeRefitPolicy from explicit gates.
 
-    The activation gate uses the Wilson upper bound on calibration FPR; with
-    k=0 false accepts that bound is z^2/(n+z^2), so the gate can only ever pass
-    when n_calib_h0 >= z^2*(1-allowed)/allowed. If the requested --min-calib-h0
-    is below that floor the gate is mathematically unsatisfiable, so we raise it
-    to the floor and record the adjustment (per the user's "auto-raise + warn").
+    The activation gate normally uses the Wilson upper bound on calibration FPR;
+    with k=0 false accepts that bound is z^2/(n+z^2), so the gate can only ever
+    pass when n_calib_h0 >= z^2*(1-allowed)/allowed. If the requested
+    --min-calib-h0 is below that floor the gate is mathematically unsatisfiable,
+    so we raise it to the floor and record the adjustment.
+
+    With `use_wilson=False` (the --no-wilson switch) the Wilson upper-bound gate
+    and its calib-H0 floor are disabled: a large margin makes the allowed FPR
+    bound >= 1.0 so the gate's `wilson_upper <= allowed` check always passes.
+    Activation then depends only on the count gates plus a FINITE NP threshold
+    (the NP threshold already pins empirical calib FPR to ~target on the calib
+    set by construction, so FPR is still controlled -- only the extra Wilson
+    safety margin is dropped). NOTE: --no-wilson does NOT relax
+    `require_finite_threshold`; if the scorer cannot place a finite NP cut at the
+    target FPR (e.g. a tree scorer with >target-fraction of H0 tied at the top
+    score), activation still fails with reason `threshold_not_finite`.
     """
-    fpr_wilson_margin = max(0.03, float(target_fpr))
-    allowed = float(target_fpr) + fpr_wilson_margin
-    wilson_min = max(1, ceil(WILSON_Z * WILSON_Z * (1.0 - allowed) / allowed))
-    eff_calib_h0 = max(int(min_calib_h0), wilson_min)
+    if use_wilson:
+        fpr_wilson_margin = max(0.03, float(target_fpr))
+        allowed = float(target_fpr) + fpr_wilson_margin
+        wilson_min = max(1, ceil(WILSON_Z * WILSON_Z * (1.0 - allowed) / allowed))
+        eff_calib_h0 = max(int(min_calib_h0), wilson_min)
+    else:
+        fpr_wilson_margin = 1.0  # allowed bound >= 1.0 -> Wilson gate never binds
+        allowed = float(target_fpr) + fpr_wilson_margin
+        wilson_min = 1
+        eff_calib_h0 = int(min_calib_h0)
     floor_applied = eff_calib_h0 != int(min_calib_h0)
 
     cfg = ConservativeRefitConfig(
@@ -334,6 +353,35 @@ def scorer_state(policy: dict[str, Any], *, method: str) -> str:
     return "global"  # cosine baseline serves on the global/cold scorer
 
 
+# ── shared-cache write-through (fair A/B: identical retrieval pool) ─────────
+
+def _write_through_row(system: SemanticCacheSystem, row: DatasetRow) -> str:
+    """Force `row` into the cache regardless of HIT/MISS, returning its cache key.
+
+    Retrieval ranks candidates by cosine over whatever is IN the cache, and the
+    cache is normally populated only by MISS write-throughs -- so a more/less
+    permissive scorer builds a different cache and both systems end up retrieving
+    *different* nearest neighbours despite using the same cosine metric. Writing
+    through on EVERY request makes both systems' caches hold the identical set of
+    rows at every step, so cosine-NN returns the same candidates and the two
+    scorers are judged on exactly the same retrieved pairs (only the accept/reject
+    decision differs). Called AFTER `handle()` so the row never appears in its own
+    retrieval (no self-hit); the stream is distinct rows, so each is written once.
+    """
+    cache_key = system._cache_key_for(row.prompt)
+    embedding = system._embeddings.embed(row.prompt)
+    system.cache.put(
+        CacheEntry(
+            cache_key=cache_key,
+            query=Query(row.prompt),
+            response=Response("shared-cache-writethrough"),
+            embedding=embedding,
+            metadata=CacheMetadata(namespace=system.namespace),
+        )
+    )
+    return str(cache_key)
+
+
 # ── one system replay with full active-decision audit ──────────────────────
 
 def run_one_system(
@@ -357,6 +405,8 @@ def run_one_system(
     progress_every: int,
     log_judge_details: bool = False,
     warmup_stream: list[DatasetRow] | None = None,
+    use_wilson: bool = True,
+    shared_cache: bool = False,
 ) -> dict[str, Any]:
     # Fresh run: clear any prior persisted state. With --persist the cache still
     # persists *within* this run; we only drop leftovers from earlier runs.
@@ -392,8 +442,11 @@ def run_one_system(
         min_calib_h0=gate_min_calib_h0,
         min_calib_h1=gate_min_calib_h1,
         target_fpr=target_fpr,
+        use_wilson=use_wilson,
     )
     system.cache.runtime.oracle.refit_policy = policy_obj
+    logger.info("[%s] activation gate: use_wilson=%s allowed_fpr_bound=%.3f min_calibration_h0=%d",
+                method, use_wilson, gate_diag.allowed_fpr_bound, gate_diag.effective_min_calib_h0)
     if gate_diag.wilson_floor_applied:
         logger.warning(
             "[%s] raised min_calibration_h0 %d -> %d (Wilson-safe floor for "
@@ -413,6 +466,8 @@ def run_one_system(
             if response.source == "llm":
                 if response.cache_key is not None:
                     key_to_row[response.cache_key] = row.row_id
+            elif shared_cache:  # HIT: force the row in so caches stay identical
+                key_to_row[_write_through_row(system, row)] = row.row_id
             recorder.resolve_request(
                 idx, source=response.source,
                 accepted_key=response.cache_key if response.source == "cache" else None,
@@ -481,6 +536,11 @@ def run_one_system(
         else:  # cache HIT -> exact accept/reject join
             if first_hit_at is None:
                 first_hit_at = idx
+            # Fair A/B: write the row through even on a HIT so both systems'
+            # caches hold the identical set of rows and cosine-NN retrieves the
+            # same candidates for both. (No-op for the default policy-built cache.)
+            if shared_cache:
+                key_to_row[_write_through_row(system, row)] = row.row_id
         recorder.resolve_request(
             idx, source=response.source,
             accepted_key=response.cache_key if response.source == "cache" else None,
@@ -1138,6 +1198,9 @@ def replay_with_anchor_capture(
     state_dir: Path,
     logger,
     progress_every: int,
+    use_wilson: bool = True,
+    warmup_stream: list[DatasetRow] | None = None,
+    require_activation: bool = False,
 ) -> tuple[list[AnchorDiagRecord], dict[str, Any]]:
     """Replay the REAL online path, capturing the decision-time top-k and the
     served anchor per request so each can be compared against the gold NP anchor.
@@ -1146,6 +1209,14 @@ def replay_with_anchor_capture(
     candidate set is exactly what the oracle saw, prior to this request's
     write-through), then `system.handle` performs the real serving + learning.
     Nothing about the scorer, calibration, or policy is altered.
+
+    When `warmup_stream` is given, it is replayed first (with label collection
+    on) and the refit is force/retried exactly like the old online comparison,
+    so a trainable scorer (the ensemble) activates BEFORE the measured phase.
+    Warm-up requests are NOT recorded; the measured diagnostic records start at
+    request 1 of `stream`. With `require_activation=True` the run fails fast if
+    the scorer is still uncalibrated after warm-up (rather than emitting a
+    diagnostic with threshold=None that would mislabel every request a cold MISS).
     """
     if state_dir.exists():
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -1172,9 +1243,12 @@ def replay_with_anchor_capture(
     policy_obj, gate_diag = build_refit_policy(
         min_train_h0=gate_min_train_h0, min_train_h1=gate_min_train_h1,
         min_calib_h0=gate_min_calib_h0, min_calib_h1=gate_min_calib_h1,
-        target_fpr=target_fpr,
+        target_fpr=target_fpr, use_wilson=use_wilson,
     )
     system.cache.runtime.oracle.refit_policy = policy_obj
+    logger.info("[%s] activation gate: use_wilson=%s fpr_wilson_margin=%.3f allowed_fpr_bound=%.3f "
+                "min_calibration_h0=%d", method, use_wilson, gate_diag.fpr_wilson_margin,
+                gate_diag.allowed_fpr_bound, gate_diag.effective_min_calib_h0)
     if gate_diag.wilson_floor_applied:
         logger.warning(
             "[%s] raised min_calibration_h0 %d -> %d (Wilson-safe floor for target_fpr=%.3f)",
@@ -1186,7 +1260,111 @@ def replay_with_anchor_capture(
     key_to_row: dict[str, int] = {}
     records: list[AnchorDiagRecord] = []
 
-    logger.info("[%s] anchor-diagnostic replay of %d requests (scorer=%s, top_k=%d)",
+    warmup_diag: dict[str, Any] = {
+        "warmup_requests": 0,
+        "warmup_train_h0": 0, "warmup_train_h1": 0,
+        "warmup_calib_h0": 0, "warmup_calib_h1": 0,
+        "threshold_after_warmup": None, "scorer_version_after_warmup": 0,
+        "activated_before_measurement": False,
+    }
+
+    # ---- warm-up / activation phase (excluded from measured records) ----
+    if warmup_stream:
+        logger.info("[%s] warm-up: replaying %d requests before measurement (label collection on)",
+                    method, len(warmup_stream))
+        for widx, row in enumerate(warmup_stream, start=1):
+            recorder.set_request_index(widx)
+            response = system.handle(row.prompt)
+            if response.source == "llm" and response.cache_key is not None:
+                key_to_row[response.cache_key] = row.row_id
+            recorder.resolve_request(
+                widx, source=response.source,
+                accepted_key=response.cache_key if response.source == "cache" else None,
+            )
+            if widx % max(1, batch_size) == 0:
+                system._maybe_check_stopping()
+            if progress_every > 0 and widx % progress_every == 0:
+                wp = snapshot_policy(system)
+                logger.info("[%s][warm-up %d/%d] trained=%s calibrated=%s thr=%s",
+                            method, widx, len(warmup_stream), wp["trained"], wp["calibrated"],
+                            _fmt(wp["threshold"]))
+
+        # Force/retry the refit exactly like the old online comparison: a fit
+        # triggered mid-warm-up may have been built from a snapshot too small to
+        # pass the activation gate even though enough data has since accumulated.
+        for attempt in range(5):
+            try:
+                oracle.wait_for_fit(timeout=120)
+            except Exception as exc:
+                logger.warning("[%s] warm-up: wait_for_fit raised: %s", method, exc)
+                break
+            if snapshot_policy(system)["trained"]:
+                break
+            decision = oracle._maybe_auto_refit(current_threshold=oracle._threshold)
+            if decision is None or decision.action != RefitAction.REFIT_SCORER:
+                break
+            logger.info("[%s] warm-up: retry refit attempt %d (%s)", method, attempt + 1, decision.reason)
+
+        wp = snapshot_policy(system)
+        wc = snapshot_training_counts(system)
+        activation_status = dict(oracle.activation_status)
+        gate_reason = activation_status.get("activation_gate_reason")
+        gate_passed = activation_status.get("activation_gate_passed")
+        activated = bool(wp["trained"] and wp["calibrated"] and wp["threshold"] is not None)
+        warmup_diag = {
+            "warmup_requests": len(warmup_stream),
+            "warmup_train_h0": wc["h0_train"], "warmup_train_h1": wc["h1_train"],
+            "warmup_calib_h0": wc["h0_calibration"], "warmup_calib_h1": wc["h1_calibration"],
+            "threshold_after_warmup": wp["threshold"],
+            "scorer_version_after_warmup": wp["scorer_version"],
+            "activated_before_measurement": activated,
+            "use_wilson": bool(use_wilson),
+            "activation_gate_reason": gate_reason,
+            "activation_gate_passed": gate_passed,
+            "candidate_threshold": activation_status.get("candidate_threshold"),
+            "empirical_calibration_fpr": activation_status.get("empirical_calibration_fpr"),
+            "wilson_upper_fpr": activation_status.get("wilson_upper_fpr"),
+            "allowed_fpr_bound": activation_status.get("allowed_fpr_bound"),
+            "threshold_is_finite": activation_status.get("threshold_is_finite"),
+        }
+        logger.info(
+            "[%s] warm-up complete: trained=%s calibrated=%s threshold_after_warmup=%s "
+            "scorer_version_after_warmup=%d warmup_train_h0=%d warmup_train_h1=%d "
+            "warmup_calib_h0=%d warmup_calib_h1=%d activated_before_measurement=%s "
+            "gate_reason=%s candidate_threshold=%s empirical_calib_fpr=%s wilson_upper_fpr=%s "
+            "allowed_fpr_bound=%s threshold_is_finite=%s",
+            method, wp["trained"], wp["calibrated"], _fmt(wp["threshold"]), wp["scorer_version"],
+            wc["h0_train"], wc["h1_train"], wc["h0_calibration"], wc["h1_calibration"], activated,
+            gate_reason, _fmt(warmup_diag["candidate_threshold"]),
+            _fmt(warmup_diag["empirical_calibration_fpr"]), _fmt(warmup_diag["wilson_upper_fpr"]),
+            _fmt(warmup_diag["allowed_fpr_bound"]), warmup_diag["threshold_is_finite"],
+        )
+        recorder.reset()
+
+        if require_activation and not activated:
+            system._executor.shutdown(wait=False)
+            raise RuntimeError(
+                f"[{method}] diag-scorer requires activation but the scorer did not train/calibrate after "
+                f"warm-up (trained={wp['trained']} calibrated={wp['calibrated']} threshold={wp['threshold']}); "
+                f"activation_gate_reason={gate_reason!r} candidate_threshold={warmup_diag['candidate_threshold']} "
+                f"threshold_is_finite={warmup_diag['threshold_is_finite']} use_wilson={use_wilson} "
+                f"warmup_train_h0={wc['h0_train']} warmup_train_h1={wc['h1_train']} "
+                f"warmup_calib_h0={wc['h0_calibration']} warmup_calib_h1={wc['h1_calibration']}. "
+                "If reason is 'threshold_not_finite', --no-wilson will NOT help: the scorer cannot place a finite "
+                "NP cut at this target FPR (raise --target-fpr or address score ties). If reason is a Wilson/FPR "
+                "bound, pass --no-wilson or raise --target-fpr."
+            )
+    elif require_activation:
+        # No warm-up but activation required: still verify before measuring.
+        wp = snapshot_policy(system)
+        if not (wp["trained"] and wp["calibrated"] and wp["threshold"] is not None):
+            system._executor.shutdown(wait=False)
+            raise RuntimeError(
+                f"[{method}] diag-scorer requires activation but no warm-up was provided and the scorer is "
+                "cold (threshold=None). Provide --warmup-requests so the scorer activates before measurement."
+            )
+
+    logger.info("[%s] anchor-diagnostic replay of %d MEASURED requests (scorer=%s, top_k=%d)",
                 method, len(stream), ",".join(scorers) if scorers else scorer, top_k)
     started = time.time()
 
@@ -1288,6 +1466,7 @@ def replay_with_anchor_capture(
     final_policy = snapshot_policy(system)
     final_policy["runtime_seconds"] = time.time() - started
     final_policy["gate_diagnostics"] = gate_diag.__dict__
+    final_policy["warmup"] = warmup_diag
     system._executor.shutdown(wait=False)
     return records, final_policy
 
@@ -1457,6 +1636,31 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
     scorers = [s.strip() for s in args.scorers.split(",") if s.strip()]
     diag_scorers = scorers if args.diag_scorer == "ensemble" else None
 
+    # The ensemble must be warm-started/activated before measurement (cosine may
+    # run cold). If no --warmup-requests is given for the ensemble, default to a
+    # warm-up large enough to reach the train/calibration gates.
+    require_activation = args.diag_scorer == "ensemble"
+    # Wilson is OFF by default in the diagnostic (--use-wilson re-enables it). The
+    # NP threshold already pins calib FPR to ~target; we drop the extra Wilson
+    # safety margin so activation is not blocked by it.
+    use_wilson = bool(getattr(args, "use_wilson", False))
+    logger.info("activation gate Wilson upper-bound: %s", "ON (--use-wilson)" if use_wilson else "OFF (default)")
+    warmup_requests = int(args.warmup_requests)
+    if require_activation and warmup_requests <= 0:
+        warmup_requests = max(4000, int(args.max_requests))
+        logger.info("ensemble diag: no --warmup-requests given; defaulting warm-up to %d requests",
+                    warmup_requests)
+    warmup_stream: list[DatasetRow] | None = None
+    if warmup_requests > 0:
+        warmup_stream, warmup_selection_diag = build_stream(
+            rows, max_requests=warmup_requests, seed=int(args.seed) + 1_000_000,
+            selection=str(args.selection), reuse_clusters_top_k=int(args.reuse_clusters_top_k),
+            reuse_min_cluster_size=int(args.reuse_min_cluster_size),
+            mixed_reuse_fraction=float(args.mixed_reuse_fraction),
+        )
+        logger.info("warm-up stream length=%d (seed offset +1e6) selection=%s",
+                    len(warmup_stream), warmup_selection_diag.get("mode"))
+
     records, final_policy = replay_with_anchor_capture(
         method=args.diag_scorer, scorer=args.diag_scorer, scorers=diag_scorers,
         stream=stream, rows_by_id=rows_by_id,
@@ -1466,6 +1670,7 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
         gate_min_calib_h0=int(args.min_calib_h0), gate_min_calib_h1=int(args.min_calib_h1),
         parallelism=int(args.parallelism), persistence=bool(args.persist),
         state_dir=out_dir / "state", logger=logger, progress_every=int(args.progress_every),
+        use_wilson=use_wilson, warmup_stream=warmup_stream, require_activation=require_activation,
     )
 
     metrics = aggregate_anchor_diagnostics(records)
@@ -1473,17 +1678,26 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
         "npz": str(args.npz), "output_dir": str(out_dir), "diag_scorer": args.diag_scorer,
         "scorers": scorers, "seed": args.seed, "target_fpr": args.target_fpr,
         "cache_universe": len(rows), "stream_length": len(stream), "top_k": args.top_k,
+        "use_wilson": use_wilson,
         "selection": selection_diag.get("mode"), "max_requests": args.max_requests,
         "min_train_h0": args.min_train_h0, "min_train_h1": args.min_train_h1,
         "min_calib_h0": args.min_calib_h0, "min_calib_h1": args.min_calib_h1,
         "trained": final_policy["trained"], "calibrated": final_policy["calibrated"],
         "final_threshold": final_policy["threshold"],
         "label_distribution_selected": dist,
+        "warmup": final_policy.get("warmup"),
     }
     write_anchor_diagnostics(out_dir, records, metrics, config)
 
     rc, rt = metrics["raw_counts"], metrics["rates"]
     logger.info("=== ANCHOR DIAGNOSTIC RESULT ===")
+    wu = final_policy.get("warmup") or {}
+    logger.info("warmup: requests=%s activated_before_measurement=%s threshold_after_warmup=%s "
+                "scorer_version_after_warmup=%s (train_h0=%s train_h1=%s calib_h0=%s calib_h1=%s)",
+                wu.get("warmup_requests"), wu.get("activated_before_measurement"),
+                _fmt(wu.get("threshold_after_warmup")), wu.get("scorer_version_after_warmup"),
+                wu.get("warmup_train_h0"), wu.get("warmup_train_h1"),
+                wu.get("warmup_calib_h0"), wu.get("warmup_calib_h1"))
     logger.info("gold_availability=%s top1_gold=%s topk_recall=%s",
                 _rate_str(rt["gold_anchor_cache_availability_rate"]),
                 _rate_str(rt["top1_gold_match_rate"]), _rate_str(rt["topk_gold_recall"]))
@@ -1698,6 +1912,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     }
     write_json(out_dir / "schema_report.json", schema)
 
+    use_wilson = bool(getattr(args, "use_wilson", False))
+    logger.info("activation gate Wilson upper-bound: %s", "ON (--use-wilson)" if use_wilson else "OFF (default)")
+    shared_cache = bool(getattr(args, "shared_cache", False))
+    logger.info("shared-cache write-through (fair A/B, identical retrieval pool): %s",
+                "ON (--shared-cache)" if shared_cache else "OFF (each scorer builds its own cache)")
+
     results: dict[str, dict[str, Any]] = {}
     for method, scorer, scs in (("ensemble", "ensemble", scorers), ("cosine", "cosine", None)):
         results[method] = run_one_system(
@@ -1712,6 +1932,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             progress_every=int(args.progress_every),
             log_judge_details=bool(args.log_judge_details),
             warmup_stream=warmup_stream,
+            use_wilson=use_wilson,
+            shared_cache=shared_cache,
         )
 
     write_artifacts(out_dir, results["cosine"], results["ensemble"], config)
@@ -1741,6 +1963,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Convenience alias for --mode retrieved_anchor_diagnostics.")
     p.add_argument("--diag-scorer", choices=["cosine", "ensemble"], default="ensemble",
                    help="retrieved_anchor_diagnostics: which single online system to replay/audit.")
+    p.add_argument("--use-wilson", dest="use_wilson", action="store_true",
+                   help="retrieved_anchor_diagnostics: re-enable the Wilson upper-bound activation gate "
+                        "(+ its calib-H0 floor). Default: OFF -- the NP threshold already controls calib FPR, "
+                        "so activation gates only on counts + a finite threshold.")
+    p.add_argument("--shared-cache", dest="shared_cache", action="store_true",
+                   help="compare mode: write every request's row into the cache even on a HIT, so cosine and "
+                        "ensemble caches hold the IDENTICAL set of rows and cosine-NN retrieves the same "
+                        "candidates for both -- a fair A/B where only the accept/reject decision differs. "
+                        "Default: OFF (each scorer's hit/miss decisions shape its own cache).")
     p.add_argument("--npz", default=str(ROOT.parent / "data" / "h1h0_final.npz"))
     p.add_argument("--output-dir", default=None, help="Default: timestamped experiments/ dir.")
     p.add_argument("--query-field", default="text")

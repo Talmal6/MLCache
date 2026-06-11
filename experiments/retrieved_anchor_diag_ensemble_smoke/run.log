@@ -1,0 +1,23 @@
+2026-06-10T22:39:15 INFO logging initialized; run.log at experiments\retrieved_anchor_diag_ensemble_smoke\run.log
+2026-06-10T22:39:15 INFO === RETRIEVED-ANCHOR DIAGNOSTICS ===
+2026-06-10T22:39:15 INFO npz: C:/Work/MLCache/data/h1h0_final.npz  output_dir: experiments\retrieved_anchor_diag_ensemble_smoke  diag_scorer: ensemble
+2026-06-10T22:39:23 INFO cache_universe=4000 clusters_with_gold_anchor=965 emb_dim=1024
+2026-06-10T22:39:23 INFO warm-up stream length=4000 (seed offset +1e6) selection=mixed
+2026-06-10T22:39:23 WARNING [ensemble] raised min_calibration_h0 20 -> 35 (Wilson-safe floor for target_fpr=0.050)
+2026-06-10T22:39:23 INFO [ensemble] warm-up: replaying 4000 requests before measurement (label collection on)
+2026-06-10T22:39:26 INFO [ensemble][warm-up 1000/4000] trained=False calibrated=False thr=None
+2026-06-10T22:39:31 INFO [ensemble][warm-up 2000/4000] trained=False calibrated=False thr=None
+2026-06-10T22:39:36 INFO [ensemble][warm-up 3000/4000] trained=False calibrated=False thr=None
+2026-06-10T22:39:42 INFO [ensemble][warm-up 4000/4000] trained=False calibrated=False thr=None
+2026-06-10T22:39:43 INFO [ensemble] warm-up: retry refit attempt 1 (initial_fit_ready)
+2026-06-10T22:41:30 INFO [ensemble] warm-up complete: trained=True calibrated=True threshold_after_warmup=0.0375 scorer_version_after_warmup=2 warmup_train_h0=12216 warmup_train_h1=807 warmup_calib_h0=2310 warmup_calib_h1=57 activated_before_measurement=True
+2026-06-10T22:41:30 INFO [ensemble] anchor-diagnostic replay of 1000 MEASURED requests (scorer=cosine,lda,pca_whitened_cosine,xgboost,mlp, top_k=5)
+2026-06-10T22:41:30 WARNING [ensemble] cache HIT had no judged served-candidate label (self-pair skip or uncertain); excluded from FPR/TPR. Expected for exact-duplicate hits.
+2026-06-10T22:45:18 INFO [ensemble][1000/1000] hits=584 trained=True calibrated=True thr=0.0379
+2026-06-10T22:45:18 INFO === ANCHOR DIAGNOSTIC RESULT ===
+2026-06-10T22:45:18 INFO warmup: requests=4000 activated_before_measurement=True threshold_after_warmup=0.0375 scorer_version_after_warmup=2 (train_h0=12216 train_h1=807 calib_h0=2310 calib_h1=57)
+2026-06-10T22:45:18 INFO gold_availability=0.7790 (779/1000) top1_gold=0.1090 (109/1000) topk_recall=0.5570 (557/1000)
+2026-06-10T22:45:18 INFO active_tp=138 active_fp=60 active_precision=0.6970 (138/198) active_fp_rate=0.3030 (60/198)
+2026-06-10T22:45:18 INFO scorer_tpr_given_gold_anchor=0.8473 (111/131)  dominant_active_fp_bucket=gold_in_topk_not_selected
+2026-06-10T22:45:18 INFO verdict: This is a RETRIEVAL / anchor-selection problem, NOT a scorer/calibration problem: the scorer accepts the forced gold anchor at a high rate (0.8473 (111/131)) -- consistent with the passing np_compat / forced-gold modes -- yet online serves 60 active FPs because the dominant active-FP bucket is `gold_in_topk_not_selected` and top-1 retrieval returns the gold anchor only 0.1090 (109/1000) of the time (gold available 0.7790 (779/1000)).
+2026-06-10T22:45:18 INFO artifacts -> C:\Work\MLCache\MLCache\experiments\retrieved_anchor_diag_ensemble_smoke
