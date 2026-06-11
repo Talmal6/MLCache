@@ -18,6 +18,15 @@ ml = [
 embeddings = [
     "sentence-transformers>=2.7",
 ]
+llm = [
+    "openai>=1.0",
+    "httpx>=0.27",
+]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2",
+]
 dev = [
     "pytest>=7",
 ]
@@ -26,6 +35,11 @@ all = [
     "xgboost>=1.7",
     "pytest>=7",
     "sentence-transformers>=2.7",
+    "openai>=1.0",
+    "httpx>=0.27",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2",
 ]
 
 [build-system]
