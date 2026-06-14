@@ -33,6 +33,7 @@ src/mlcache/cache/in_memory.py
 src/mlcache/cache/kv.py
 src/mlcache/cache/mysql_gateway.py
 src/mlcache/cache/postgres_gateway.py
+src/mlcache/cache/sqlite_gateway.py
 src/mlcache/cache/types.py
 src/mlcache/calibration/__init__.py
 src/mlcache/calibration/np_threshold.py
@@ -73,6 +74,7 @@ src/mlcache/persistence/binary.py
 src/mlcache/persistence/json_utils.py
 src/mlcache/persistence/mysql.py
 src/mlcache/persistence/postgres.py
+src/mlcache/persistence/sqlite.py
 src/mlcache/policies/__init__.py
 src/mlcache/policies/base.py
 src/mlcache/policies/fallback.py
@@ -126,7 +128,9 @@ tests/test_api_server.py
 tests/test_cached_llm.py
 tests/test_cli_smoke.py
 tests/test_compare_cosine_vs_ensemble.py
+tests/test_cosine_decision_path_regression.py
 tests/test_e2e_cache_pipeline.py
+tests/test_ensemble_scorer.py
 tests/test_faiss_vector_store.py
 tests/test_file_persistence.py
 tests/test_h1h0_local_runner.py
@@ -134,6 +138,7 @@ tests/test_h1h0_npz_adapters.py
 tests/test_hadamard_features.py
 tests/test_imports.py
 tests/test_in_memory_backends.py
+tests/test_llm_judge_vllm_integration.py
 tests/test_local_runtime_factory.py
 tests/test_mlcache_builder.py
 tests/test_mysql_faiss_integration.py
@@ -155,4 +160,6 @@ tests/test_semantic_cache_system.py
 tests/test_shadow_collector.py
 tests/test_split_judge_store.py
 tests/test_sql_storage_contracts.py
+tests/test_sqlite_faiss_integration.py
+tests/test_sqlite_storage_contract.py
 tests/test_wilson.py

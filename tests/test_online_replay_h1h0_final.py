@@ -43,6 +43,7 @@ def _sklearn_ok() -> bool:
 skip_no_sklearn = pytest.mark.skipif(not _sklearn_ok(), reason="sklearn not installed")
 
 import online_replay_h1h0_final as exp  # noqa: E402
+import submit_replay_array as submit  # noqa: E402
 from compare_cosine_vs_ensemble import (  # noqa: E402
     DatasetEmbeddingProvider,
     DatasetH1H0Judge,
@@ -273,6 +274,93 @@ def test_shared_cache_makes_both_systems_judge_identical_pairs(tiny_npz, tmp_pat
 
 
 # ── 5. activation only after gates satisfied ───────────────────────────────
+
+def test_improvement_verdict_maximizes_tpr_within_active_fpr_budget():
+    cosine = {
+        "trained": True, "activation_request_index": None, "target_fpr": 0.05,
+        "active_fpr": 0.045, "active_tpr": 0.60,
+    }
+    ensemble = {
+        "trained": True, "activation_request_index": 10, "target_fpr": 0.05,
+        "active_fpr": 0.049, "active_tpr": 0.70,
+    }
+
+    verdict = exp._improvement_verdict(cosine, ensemble)
+    assert "ensemble has higher active TPR" in verdict
+
+
+def test_improvement_verdict_rejects_higher_tpr_outside_budget():
+    cosine = {
+        "trained": True, "activation_request_index": None, "target_fpr": 0.05,
+        "active_fpr": 0.045, "active_tpr": 0.60,
+    }
+    ensemble = {
+        "trained": True, "activation_request_index": 10, "target_fpr": 0.05,
+        "active_fpr": 0.051, "active_tpr": 0.90,
+    }
+
+    verdict = exp._improvement_verdict(cosine, ensemble)
+    assert verdict.startswith("no: cosine is the only method satisfying")
+
+
+def test_old_result_checkpoint_is_rejected(tmp_path):
+    checkpoint = tmp_path / "result_checkpoint.json"
+    checkpoint.write_text(
+        '{"summary": {}, "minimal_rows": [], "audit_rows": []}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="checkpoint version"):
+        exp._load_system_checkpoint(checkpoint)
+
+
+def test_array_paper_defaults_match_run_llm_replay_sbatch():
+    args = submit.parse_args([])
+
+    assert args.modes == ["compare"]
+    assert args.seeds == [42]
+    assert args.max_requests == 40000
+    assert args.cache_size == 40000
+    assert args.target_fprs == [0.05]
+    assert args.selections == ["uniform"]
+    assert args.scorers_list == [submit.FULL_ENSEMBLE]
+    assert args.progress_every == 100
+    assert args.warmup_requests == 4000
+    assert args.time == "48:00:00"
+    assert args.job_name == "mlcache_llm_replay"
+    assert args.vllm_base_url == "http://localhost:8000/v1"
+    assert args.vllm_model == "Qwen/Qwen3-8B-AWQ"
+    assert args.vllm_api_key == "local-vllm-token"
+    assert args.vllm_startup_timeout == 600
+
+
+def test_array_task_command_includes_progress_cadence(tmp_path):
+    args = submit.parse_args(["--exp-root", str(tmp_path)])
+    tasks = submit.build_replay_suite(
+        tmp_path,
+        seeds=args.seeds,
+        target_fprs=args.target_fprs,
+        selections=args.selections,
+        scorers_list=args.scorers_list,
+        modes=args.modes,
+        max_requests=args.max_requests,
+        cache_size=args.cache_size,
+        warmup_requests=args.warmup_requests,
+        progress_every=args.progress_every,
+        top_k=args.top_k,
+        batch_size=args.batch_size,
+        min_train_h0=args.min_train_h0,
+        min_train_h1=args.min_train_h1,
+        min_calib_h0=args.min_calib_h0,
+        min_calib_h1=args.min_calib_h1,
+        npz_path=submit.DEFAULT_NPZ,
+        extra_flags=(),
+    )
+    command = submit.task_to_cli_args(tasks[0], "python")
+
+    assert command[command.index("--progress-every") + 1] == "100"
+    assert command[command.index("--warmup-requests") + 1] == "4000"
+
 
 @skip_no_sklearn
 def test_ensemble_does_not_activate_with_unreachable_gates(tiny_npz, tmp_path):

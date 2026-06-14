@@ -337,12 +337,38 @@ class MetricsRecorder:
             self.unjudged_accepts = 0
 
     def metrics(self) -> dict[str, Any]:
+        return self.metrics_since(None)
+
+    def count_snapshot(self) -> dict[str, int]:
+        """Return an atomic confusion-count snapshot for phase deltas."""
         with self._lock:
-            ta, fa = self.true_accepts, self.false_accepts
-            tr, fr = self.true_rejects, self.false_rejects
-            unjudged = self.unjudged_accepts
-            judge_events = self.judge_events
-            uncertain = self.uncertain_events
+            return {
+                "true_accepts": int(self.true_accepts),
+                "false_accepts": int(self.false_accepts),
+                "true_rejects": int(self.true_rejects),
+                "false_rejects": int(self.false_rejects),
+                "unjudged_accepts": int(self.unjudged_accepts),
+                "judge_events": int(self.judge_events),
+                "uncertain_events": int(self.uncertain_events),
+            }
+
+    def metrics_since(self, baseline: dict[str, int] | None) -> dict[str, Any]:
+        """Compute metrics from counts observed after ``baseline``.
+
+        This is used to exclude cold-start requests from active-session FPR:
+        before a threshold exists, every candidate is necessarily rejected and
+        counting those rejections as active true negatives biases FPR downward.
+        """
+        current = self.count_snapshot()
+        base = baseline or {key: 0 for key in current}
+        counts = {key: current[key] - int(base.get(key, 0)) for key in current}
+        ta = counts["true_accepts"]
+        fa = counts["false_accepts"]
+        tr = counts["true_rejects"]
+        fr = counts["false_rejects"]
+        unjudged = counts["unjudged_accepts"]
+        judge_events = counts["judge_events"]
+        uncertain = counts["uncertain_events"]
         empirical_fpr = safe_rate(fa, fa + tr)
         tpr = safe_rate(ta, ta + fr)
         precision = safe_rate(ta, ta + fa)

@@ -119,7 +119,7 @@ def test_gold_anchor_missing_not_a_retrieval_success():
     assert c["topk_contains_gold_anchor_count"] == 0
 
 
-# ── 5. denominators: active_fp_rate and active_precision agree ──────────────
+# ── 5. denominators: active_fdr and active_precision agree ─────────────────
 
 def test_active_rate_denominators_are_consistent():
     records = []
@@ -145,15 +145,15 @@ def test_active_rate_denominators_are_consistent():
     assert c["active_judged_hits"] == c["active_tp"] + c["active_fp"] == 5
     assert c["active_unjudged_hits"] == 1  # the self-pair HIT
 
-    # active_fp_rate = active_fp / active_judged_hits
-    assert rt["active_fp_rate"]["value"] == pytest.approx(3 / 5)
-    assert rt["active_fp_rate"]["denominator"] == 5
+    # active_fdr = active_fp / active_judged_hits
+    assert rt["active_fdr"]["value"] == pytest.approx(3 / 5)
+    assert rt["active_fdr"]["denominator"] == 5
     # active_precision = active_tp / (active_tp + active_fp)
     assert rt["active_precision"]["value"] == pytest.approx(2 / 5)
     assert rt["active_precision"]["denominator"] == 5
     # The two rates must share the identical denominator (not silently different).
-    assert rt["active_fp_rate"]["denominator"] == rt["active_precision"]["denominator"]
-    assert rt["active_fp_rate"]["value"] + rt["active_precision"]["value"] == pytest.approx(1.0)
+    assert rt["active_fdr"]["denominator"] == rt["active_precision"]["denominator"]
+    assert rt["active_fdr"]["value"] + rt["active_precision"]["value"] == pytest.approx(1.0)
 
 
 # ── forced gold-anchor TPR uses only judged H1 gold pairs ───────────────────

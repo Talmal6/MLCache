@@ -11,6 +11,7 @@ miss, and structured response metadata.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -189,7 +190,10 @@ class LLMJudge(SemanticReuseJudge):
 
     @staticmethod
     def _parse_label(text: str) -> JudgeLabel:
-        normalized = text.strip().upper()
+        # Reasoning models (e.g. Qwen3) emit <think>...</think> before the
+        # verdict token.  Strip that block so exact matching still works.
+        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        normalized = cleaned.upper()
         if normalized == "REUSABLE":
             return JudgeLabel.REUSABLE
         if normalized == "NOT_REUSABLE":
