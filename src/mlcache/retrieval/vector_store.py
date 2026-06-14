@@ -41,5 +41,6 @@ class VectorStore(ABC):
         *,
         namespace: str | None = None,
         top_k: int = 10,
+        metadata: CacheMetadata | None = None,
     ) -> list[VectorSearchResult]:
         raise NotImplementedError

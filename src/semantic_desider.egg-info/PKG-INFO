@@ -9,6 +9,20 @@ Requires-Dist: scikit-learn>=1.2; extra == "ml"
 Requires-Dist: xgboost>=1.7; extra == "ml"
 Provides-Extra: embeddings
 Requires-Dist: sentence-transformers>=2.7; extra == "embeddings"
+Provides-Extra: faiss
+Requires-Dist: faiss-cpu>=1.8; extra == "faiss"
+Provides-Extra: postgres
+Requires-Dist: psycopg[binary]>=3.1; extra == "postgres"
+Provides-Extra: mysql
+Requires-Dist: pymysql>=1.1; extra == "mysql"
+Requires-Dist: cryptography>=42; extra == "mysql"
+Provides-Extra: llm
+Requires-Dist: openai>=1.0; extra == "llm"
+Requires-Dist: httpx>=0.27; extra == "llm"
+Provides-Extra: api
+Requires-Dist: fastapi>=0.110; extra == "api"
+Requires-Dist: uvicorn[standard]>=0.27; extra == "api"
+Requires-Dist: pydantic>=2; extra == "api"
 Provides-Extra: dev
 Requires-Dist: pytest>=7; extra == "dev"
 Provides-Extra: all
@@ -16,3 +30,12 @@ Requires-Dist: scikit-learn>=1.2; extra == "all"
 Requires-Dist: xgboost>=1.7; extra == "all"
 Requires-Dist: pytest>=7; extra == "all"
 Requires-Dist: sentence-transformers>=2.7; extra == "all"
+Requires-Dist: faiss-cpu>=1.8; extra == "all"
+Requires-Dist: psycopg[binary]>=3.1; extra == "all"
+Requires-Dist: pymysql>=1.1; extra == "all"
+Requires-Dist: cryptography>=42; extra == "all"
+Requires-Dist: openai>=1.0; extra == "all"
+Requires-Dist: httpx>=0.27; extra == "all"
+Requires-Dist: fastapi>=0.110; extra == "all"
+Requires-Dist: uvicorn[standard]>=0.27; extra == "all"
+Requires-Dist: pydantic>=2; extra == "all"

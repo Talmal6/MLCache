@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from mlcache.retrieval.vector_store import VectorSearchResult, VectorStore
-from mlcache.semantic_types import CacheEntry, CacheKey, Embedding, Score
+from mlcache.semantic_types import CacheEntry, CacheKey, CacheMetadata, Embedding, Score
 
 
 class InMemoryVectorStore(VectorStore):
@@ -102,7 +102,9 @@ class InMemoryVectorStore(VectorStore):
         *,
         namespace: str | None = None,
         top_k: int = 10,
+        metadata: CacheMetadata | None = None,
     ) -> list[VectorSearchResult]:
+        del metadata
         k = max(0, int(top_k))
         if self._count == 0 or k == 0:
             return []

@@ -18,6 +18,21 @@ ml = [
 embeddings = [
     "sentence-transformers>=2.7",
 ]
+faiss = [
+    "faiss-cpu>=1.8",
+]
+postgres = [
+    "psycopg[binary]>=3.1",
+]
+mysql = [
+    "pymysql>=1.1",
+    "cryptography>=42",
+]
+sqlite = [
+    # SQLite ships with CPython's stdlib (the `sqlite3` module), so the storage
+    # backend itself needs no extra packages. FAISS is still required for the
+    # vector backend; install it alongside, e.g. `pip install -e '.[sqlite,faiss]'`.
+]
 llm = [
     "openai>=1.0",
     "httpx>=0.27",
@@ -35,6 +50,10 @@ all = [
     "xgboost>=1.7",
     "pytest>=7",
     "sentence-transformers>=2.7",
+    "faiss-cpu>=1.8",
+    "psycopg[binary]>=3.1",
+    "pymysql>=1.1",
+    "cryptography>=42",
     "openai>=1.0",
     "httpx>=0.27",
     "fastapi>=0.110",

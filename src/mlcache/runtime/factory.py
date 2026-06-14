@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 
 from mlcache.cache import KVStore, SemanticCacheGateway
@@ -52,6 +53,7 @@ def build_mlcache_runtime(
     query_level_shadow_store: QueryLevelShadowDecisionStore | None = None,
     query_record_store: QueryCalibrationRecordStore | None = None,
     query_level_threshold: Threshold | None = None,
+    gateway_factory: Callable[[KVStore, TrainableSemanticCacheOracle], SemanticCacheGateway] | None = None,
     config: MLCacheRuntimeConfig | None = None,
 ) -> MLCacheRuntime:
     runtime_config = config or MLCacheRuntimeConfig()
@@ -128,7 +130,11 @@ def build_mlcache_runtime(
         target_false_accept_rate=runtime_config.refit.target_false_accept_rate,
         top_k=runtime_config.refit.top_k,
     )
-    gateway = SemanticCacheGateway(kv_store=kv_store, oracle=oracle)
+    gateway = (
+        gateway_factory(kv_store, oracle)
+        if gateway_factory is not None
+        else SemanticCacheGateway(kv_store=kv_store, oracle=oracle)
+    )
 
     return MLCacheRuntime(
         gateway=gateway,

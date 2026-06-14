@@ -277,11 +277,21 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         request: CacheLookup,
         snapshot: OracleRuntimeSnapshot,
     ) -> OracleScoredResult:
-        candidates = self.vector_store.search(
-            request.embedding,
-            namespace=request.namespace,
-            top_k=snapshot.top_k,
-        )
+        try:
+            candidates = self.vector_store.search(
+                request.embedding,
+                namespace=request.namespace,
+                top_k=snapshot.top_k,
+                metadata=request.metadata,
+            )
+        except TypeError as exc:
+            if "metadata" not in str(exc):
+                raise
+            candidates = self.vector_store.search(
+                request.embedding,
+                namespace=request.namespace,
+                top_k=snapshot.top_k,
+            )
         if not candidates:
             return OracleScoredResult(
                 decision=OracleDecision(
@@ -367,9 +377,11 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
                 {
                     "rank": rank,
                     "cache_key": str(candidate.cache_key),
+                    "faiss_id": self._candidate_faiss_id(candidate),
                     "score": float(score),
                     "accepted": accepted,
                     "vector_score": float(candidate.score),
+                    "metadata": dict(candidate.metadata.attributes),
                 }
             )
             if accepted and (best_score is None or float(score) > float(best_score)):
@@ -1270,3 +1282,15 @@ class TrainableSemanticCacheOracle(SemanticCacheOracle):
         if main is not None:
             return tuple(float(v) for v in main)
         return ()
+
+    @staticmethod
+    def _candidate_faiss_id(candidate: VectorSearchResult) -> int | None:
+        raw = candidate.payload.get("faiss_id")
+        if raw is None:
+            raw = candidate.metadata.attributes.get("faiss_id")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None

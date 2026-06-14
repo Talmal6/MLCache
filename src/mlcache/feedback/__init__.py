@@ -25,6 +25,9 @@ from mlcache.feedback.store import (
     TrainingExampleEvictionPolicy,
 )
 from mlcache.feedback.types import JudgeDecision, JudgeLabel, JudgeRequest, JudgeResult
+from mlcache.persistence.mysql import MySQLJudgeTrainingStore, MySQLSplitJudgeTrainingStore
+from mlcache.persistence.postgres import PostgresJudgeTrainingStore, PostgresSplitJudgeTrainingStore
+from mlcache.persistence.sqlite import SQLiteJudgeTrainingStore, SQLiteSplitJudgeTrainingStore
 
 __all__ = [
     "FIFOTrainingExampleEvictionPolicy",
@@ -42,6 +45,12 @@ __all__ = [
     "JudgeResult",
     "JudgedPairExample",
     "JudgeTrainingStore",
+    "MySQLJudgeTrainingStore",
+    "MySQLSplitJudgeTrainingStore",
+    "PostgresJudgeTrainingStore",
+    "PostgresSplitJudgeTrainingStore",
+    "SQLiteJudgeTrainingStore",
+    "SQLiteSplitJudgeTrainingStore",
     "SemanticReuseJudge",
     "ShadowCollectionConfig",
     "ShadowCollectionResult",

@@ -6,6 +6,10 @@ from mlcache.cache import (
     FileKVStore,
     InMemoryKVStore,
     KVStore,
+    MySQLKVStore,
+    MySQLSemanticCacheGateway,
+    PostgresKVStore,
+    PostgresSemanticCacheGateway,
     SemanticCacheGateway,
 )
 
@@ -15,5 +19,9 @@ __all__ = [
     "FileKVStore",
     "InMemoryKVStore",
     "KVStore",
+    "MySQLKVStore",
+    "MySQLSemanticCacheGateway",
+    "PostgresKVStore",
+    "PostgresSemanticCacheGateway",
     "SemanticCacheGateway",
 ]

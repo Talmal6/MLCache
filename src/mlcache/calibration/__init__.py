@@ -20,6 +20,9 @@ from mlcache.calibration.query_level import (
 from mlcache.calibration.threshold_store import FileThresholdProvider, InMemoryThresholdProvider
 from mlcache.calibration.types import CalibrationExample, ThresholdCalibrationRequest, ThresholdScope
 from mlcache.calibration.wilson import wilson_upper_bound
+from mlcache.persistence.mysql import MySQLQueryCalibrationRecordStore, MySQLThresholdProvider
+from mlcache.persistence.postgres import PostgresQueryCalibrationRecordStore, PostgresThresholdProvider
+from mlcache.persistence.sqlite import SQLiteQueryCalibrationRecordStore, SQLiteThresholdProvider
 
 __all__ = [
     "CalibrationExample",
@@ -28,6 +31,12 @@ __all__ = [
     "FileQueryCalibrationRecordStore",
     "FileThresholdProvider",
     "InMemoryThresholdProvider",
+    "MySQLQueryCalibrationRecordStore",
+    "MySQLThresholdProvider",
+    "PostgresQueryCalibrationRecordStore",
+    "PostgresThresholdProvider",
+    "SQLiteQueryCalibrationRecordStore",
+    "SQLiteThresholdProvider",
     "QueryCalibrationCandidate",
     "QueryCalibrationDataset",
     "QueryCalibrationDecision",
