@@ -31,11 +31,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import ceil
 from pathlib import Path
@@ -51,11 +53,20 @@ for _p in (str(SRC), str(SCRIPTS), str(EXP)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from mlcache import MockLLM, SemanticCacheSystem  # noqa: E402
+from mlcache import SemanticCacheSystem  # noqa: E402
+from mlcache.feedback import JudgeDecision, JudgeLabel, JudgeRequest, JudgeResult  # noqa: E402
+from mlcache.llm_wrapper import LLMClient, LLMJudge, LLMResponse  # noqa: E402
 from mlcache.policies import ConservativeRefitConfig, ConservativeRefitPolicy  # noqa: E402
 from mlcache.policies.refit import RefitAction  # noqa: E402
+from mlcache.scorers.base import SemanticScorer  # noqa: E402
 from mlcache.scorers.utils import score_rows_with_scorer  # noqa: E402
-from mlcache.semantic_types import CacheEntry, CacheMetadata, Query, Response  # noqa: E402
+from mlcache.semantic_types import (  # noqa: E402
+    CacheEntry,
+    CacheMetadata,
+    Query,
+    Response,
+    TieMode,
+)
 
 # Gold-anchor machinery: the retrieved-anchor diagnostic compares against the
 # SAME centroid-nearest cluster anchor np_compat_pair_eval uses, so we import
@@ -65,12 +76,12 @@ import np_compat_audit as nca  # noqa: E402
 # Proven, already-tested dataset components are reused rather than reimplemented.
 from compare_cosine_vs_ensemble import (  # noqa: E402
     DatasetEmbeddingProvider,
-    DatasetH1H0Judge,
     DatasetRow,
     FULL_ENSEMBLE,
     MetricsRecorder,
     append_jsonl,
     load_rows,
+    row_id_from_prompt,
     safe_rate,
     setup_logging,
     snapshot_policy,
@@ -81,6 +92,411 @@ from compare_cosine_vs_ensemble import (  # noqa: E402
 )
 
 WILSON_Z = 1.96
+
+
+# ── real LLM backend (vLLM OpenAI-compatible server) ────────────────────────
+
+@dataclass
+class VLLMChatClient:
+    """`LLMClient` backed by an OpenAI-compatible vLLM server.
+
+    Used both as the system's response generator (cache-miss fallback) and,
+    via `LLMJudgeWithRecorder`, as the LLM-as-judge backend. Qwen3 models emit
+    `<think>...</think>` reasoning blocks unless thinking is disabled, so we
+    pass `chat_template_kwargs={"enable_thinking": False}` to keep judge
+    replies to a single label token.
+    """
+
+    base_url: str = "http://localhost:8000/v1"
+    model: str = "Qwen/Qwen3-8B-AWQ"
+    api_key: str = "local-vllm-token"
+    temperature: float = 0.0
+    max_tokens: int = 64
+
+    def __post_init__(self) -> None:
+        from openai import OpenAI
+
+        self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+
+    def generate(self, prompt: str, **kwargs: Any) -> LLMResponse:
+        completion = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=kwargs.get("temperature", self.temperature),
+            max_tokens=kwargs.get("max_tokens", self.max_tokens),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        text = completion.choices[0].message.content or ""
+        return LLMResponse(
+            text=text,
+            raw=completion,
+            metadata={"provider": "vllm", "model": self.model},
+        )
+
+
+# ── train / inference latency instrumentation ──────────────────────────────
+
+@dataclass
+class ScorerLatencyStats:
+    """Thread-safe accumulators for a method's scorer fit/score/calibrate time.
+
+    `score` (inference) is called both from the serving thread and from the
+    background refit thread (calibration scores the calib set), and `fit` /
+    `calibrate` run in the background refit thread, so every counter is guarded
+    by a lock. Times are wall-clock `perf_counter` seconds.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    score_calls: int = 0
+    score_seconds: float = 0.0
+    fit_calls: int = 0
+    fit_seconds: float = 0.0
+    calibrate_calls: int = 0
+    calibrate_seconds: float = 0.0
+
+    def add_score(self, dt: float) -> None:
+        with self.lock:
+            self.score_calls += 1
+            self.score_seconds += dt
+
+    def add_fit(self, dt: float) -> None:
+        with self.lock:
+            self.fit_calls += 1
+            self.fit_seconds += dt
+
+    def add_calibrate(self, dt: float) -> None:
+        with self.lock:
+            self.calibrate_calls += 1
+            self.calibrate_seconds += dt
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "inference": {
+                    "calls": self.score_calls,
+                    "total_seconds": self.score_seconds,
+                    "avg_ms": (1000.0 * self.score_seconds / self.score_calls)
+                    if self.score_calls else None,
+                },
+                "train": {
+                    "fits": self.fit_calls,
+                    "total_seconds": self.fit_seconds,
+                    "avg_seconds": (self.fit_seconds / self.fit_calls)
+                    if self.fit_calls else None,
+                },
+                "calibrate": {
+                    "calls": self.calibrate_calls,
+                    "total_seconds": self.calibrate_seconds,
+                    "avg_seconds": (self.calibrate_seconds / self.calibrate_calls)
+                    if self.calibrate_calls else None,
+                },
+            }
+
+
+class TimingScorer(SemanticScorer):
+    """Transparent `SemanticScorer` proxy that times `fit`/`score`/`calibrate`.
+
+    Installed as the oracle's active scorer so every refit-swap keeps timing:
+    the oracle promotes a new scorer via `old_scorer.copy_for_refit()`, and our
+    `copy_for_refit` returns a fresh `TimingScorer` sharing the SAME
+    `ScorerLatencyStats`, so cumulative train/inference latency survives every
+    atomic scorer promotion. `inference` time is the raw scorer score() cost --
+    the part that actually differs between cosine and the ensemble.
+    """
+
+    def __init__(self, inner: SemanticScorer, stats: ScorerLatencyStats) -> None:
+        self._inner = inner
+        self._stats = stats
+
+    @property
+    def inner(self) -> SemanticScorer:
+        return self._inner
+
+    @property
+    def name(self):  # noqa: ANN201 - delegate type
+        return self._inner.name
+
+    @property
+    def input_space(self):  # noqa: ANN201 - delegate type
+        return self._inner.input_space
+
+    def fit(self, batch, **kwargs: object) -> None:
+        t = time.perf_counter()
+        try:
+            self._inner.fit(batch, **kwargs)
+        finally:
+            self._stats.add_fit(time.perf_counter() - t)
+
+    def copy_for_refit(self) -> "TimingScorer":
+        return TimingScorer(self._inner.copy_for_refit(), self._stats)
+
+    def score(self, features):  # noqa: ANN001, ANN201 - delegate types
+        t = time.perf_counter()
+        try:
+            return self._inner.score(features)
+        finally:
+            self._stats.add_score(time.perf_counter() - t)
+
+    def calibrate(self, request):  # noqa: ANN001, ANN201 - delegate types
+        t = time.perf_counter()
+        try:
+            return self._inner.calibrate(request)
+        finally:
+            self._stats.add_calibrate(time.perf_counter() - t)
+
+    def predict(self, features, threshold, *, tie_mode: TieMode = TieMode.GE) -> bool:
+        # Re-implement on top of our timed score() (rather than delegating to
+        # inner.predict, which would call inner.score untimed) so predict-path
+        # inference is captured too.
+        score = float(self.score(features))
+        tau = float(threshold)
+        if tie_mode == TieMode.GT:
+            return score > tau
+        return score >= tau
+
+    def __getattr__(self, item: str) -> Any:
+        # Forward any scorer-specific attribute/method we do not override
+        # (e.g. EnsembleScorer internals introspected elsewhere).
+        return getattr(self._inner, item)
+
+
+def install_timing_scorer(system: SemanticCacheSystem) -> ScorerLatencyStats:
+    """Wrap the oracle's current scorer in a `TimingScorer` and return its stats.
+
+    Must be called before warm-up/replay so the first fit and every subsequent
+    refit-promotion are timed.
+    """
+    stats = ScorerLatencyStats()
+    oracle = system.cache.runtime.oracle
+    oracle.scorer = TimingScorer(oracle.scorer, stats)
+    return stats
+
+
+# ── persistent LLM-judge decision cache (crash/timeout resume) ──────────────
+
+class JudgeDecisionCache:
+    """Thread-safe, disk-backed cache of LLM judge labels keyed by row-id pair.
+
+    The dominant cost of this experiment is the per-candidate LLM judge call,
+    and `ShadowTopKCollector` issues those concurrently across top-k candidates
+    (so this MUST be thread-safe). Each decided pair is appended as one JSONL
+    line `{"q": <query_row_id>, "c": <candidate_row_id>, "label": ..., "text": ...}`.
+    On a resubmitted job pointed at the same cache file, every previously judged
+    pair is served from memory with no network round-trip, so a re-run after a
+    timeout/GPU death replays at pure-Python speed instead of re-calling the LLM.
+
+    The judge label for a pair depends only on (query, candidate) -- not on which
+    scorer is active -- so the cache is shared across the cosine and ensemble
+    systems and across runs.
+    """
+
+    def __init__(self, path: Path, *, logger=None) -> None:
+        self._path = Path(path)
+        self._logger = logger
+        self._lock = threading.Lock()
+        self._cache: dict[tuple[int, int], tuple[str, str]] = {}
+        self._hits = 0
+        self._misses = 0
+        self._load()
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        loaded = 0
+        with self._path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    self._cache[(int(rec["q"]), int(rec["c"]))] = (
+                        str(rec["label"]), str(rec.get("text", "")),
+                    )
+                    loaded += 1
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue  # tolerate a truncated final line from a hard kill
+        if self._logger:
+            self._logger.info("judge cache: loaded %d cached decisions from %s",
+                              loaded, self._path)
+
+    def get(self, query_row_id: int, candidate_row_id: int) -> tuple[str, str] | None:
+        with self._lock:
+            hit = self._cache.get((int(query_row_id), int(candidate_row_id)))
+            if hit is None:
+                self._misses += 1
+            else:
+                self._hits += 1
+            return hit
+
+    def put(self, query_row_id: int, candidate_row_id: int, label: str, text: str) -> None:
+        key = (int(query_row_id), int(candidate_row_id))
+        with self._lock:
+            if key in self._cache:
+                return
+            self._cache[key] = (str(label), str(text))
+            with self._path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"q": key[0], "c": key[1], "label": str(label),
+                                     "text": str(text)}) + "\n")
+                fh.flush()
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {"size": len(self._cache), "hits": self._hits, "misses": self._misses}
+
+
+class LLMJudgeWithRecorder(LLMJudge):
+    """`LLMJudge` that also feeds `MetricsRecorder` so the existing online
+    FPR/TPR machinery keeps working.
+
+    Behaves like `LLMJudge`: the served REUSABLE/NOT_REUSABLE/UNCERTAIN
+    decision driving online learning comes from the LLM's reply. The dataset
+    row lookup here is used only to enrich the recorded event with the
+    dataset's own H1/H0 labels and clusters (for post-hoc agreement analysis
+    in the audit), and to strip the `row:<id>\\t` prompt-encoding prefix
+    before showing text to the LLM.
+    """
+
+    def __init__(
+        self,
+        llm: LLMClient,
+        rows_by_id: dict[int, DatasetRow],
+        *,
+        recorder: MetricsRecorder | None = None,
+        logger=None,
+        name: str = "llm-judge",
+        judge_cache: "JudgeDecisionCache | None" = None,
+    ) -> None:
+        super().__init__(llm, name=name)
+        self._rows_by_id = rows_by_id
+        self._recorder = recorder
+        self._logger = logger
+        self._judge_cache = judge_cache
+
+    def judge(self, request: JudgeRequest) -> JudgeResult:
+        start_time = time.time()
+        if self._logger:
+            self._logger.info(f"LLMJudge: Starting judge for query '{preview_text(str(request.query))}'")
+
+        if request.candidate_query is None:
+            if self._recorder is not None:
+                self._recorder.record_judge(
+                    candidate_key=request.candidate_key,
+                    judge_label=JudgeLabel.UNCERTAIN,
+                    reason="missing candidate_query",
+                )
+            return JudgeResult(
+                request=request,
+                decision=JudgeDecision(
+                    label=JudgeLabel.UNCERTAIN,
+                    rationale="missing candidate_query",
+                    metadata={"judge": self.name},
+                ),
+            )
+
+        try:
+            q = self._rows_by_id[row_id_from_prompt(request.query)]
+            c = self._rows_by_id[row_id_from_prompt(request.candidate_query)]
+        except Exception as exc:
+            if self._recorder is not None:
+                self._recorder.record_judge(
+                    candidate_key=request.candidate_key,
+                    judge_label=JudgeLabel.UNCERTAIN,
+                    reason=f"could not decode row ids: {exc}",
+                )
+            if self._logger:
+                self._logger.warning(
+                    f"LLMJudge: Error judging query '{preview_text(str(request.query))}'. Error: {exc}"
+                )
+            return JudgeResult(
+                request=request,
+                decision=JudgeDecision(
+                    label=JudgeLabel.UNCERTAIN,
+                    rationale=f"could not decode row ids: {exc}",
+                    metadata={"judge": self.name, "error": str(exc)},
+                ),
+            )
+
+        candidate_response = (
+            str(request.candidate_response) if request.candidate_response is not None else ""
+        )
+
+        # Resume-friendly fast path: a previously judged (query, candidate) pair
+        # is served from the persistent cache with no LLM round-trip. The label
+        # is a function of the pair only, so it is valid across scorers/runs.
+        cached = (
+            self._judge_cache.get(q.row_id, c.row_id) if self._judge_cache is not None else None
+        )
+        if cached is not None:
+            label = JudgeLabel[cached[0]]
+            response_text = cached[1]
+        else:
+            prompt = self._PROMPT_TEMPLATE.format(
+                query=q.text, candidate_query=c.text, candidate_response=candidate_response,
+            )
+            response = self._llm.generate(prompt)
+            response_text = response.text
+            label = self._parse_label(response_text)
+            if self._judge_cache is not None:
+                self._judge_cache.put(q.row_id, c.row_id, label.name, response_text)
+        same_group = q.group == c.group
+
+        if self._recorder is not None:
+            self._recorder.record_judge(
+                candidate_key=request.candidate_key,
+                judge_label=label,
+                query_row_id=q.row_id,
+                candidate_row_id=c.row_id,
+                query_label=q.label,
+                candidate_label=c.label,
+                query_anchor=q.group,
+                candidate_anchor=c.group,
+                same_anchor=same_group,
+                reason=response_text,
+            )
+
+        if self._logger:
+            end_time = time.time()
+            self._logger.info(
+                f"LLMJudge: Finished judge for query '{preview_text(str(request.query))}'. "
+                f"Label: {label.name}. Took {end_time - start_time:.4f}s"
+            )
+
+        return JudgeResult(
+            request=request,
+            decision=JudgeDecision(
+                label=label,
+                rationale=response_text,
+                metadata={
+                    "judge": self.name,
+                    "query_row_id": q.row_id,
+                    "candidate_row_id": c.row_id,
+                    "query_label": q.label,
+                    "candidate_label": c.label,
+                    "query_group": q.group,
+                    "candidate_group": c.group,
+                    "same_group": same_group,
+                },
+            ),
+        )
+
+    @staticmethod
+    def _parse_label(text: str) -> JudgeLabel:
+        normalized = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip().upper()
+        if "NOT_REUSABLE" in normalized or "NOT REUSABLE" in normalized:
+            return JudgeLabel.NOT_REUSABLE
+        if "REUSABLE" in normalized:
+            return JudgeLabel.REUSABLE
+        return JudgeLabel.UNCERTAIN
+
+
+def build_llm_client(args: argparse.Namespace) -> VLLMChatClient:
+    return VLLMChatClient(
+        base_url=str(args.llm_base_url),
+        model=str(args.llm_model),
+        api_key=str(args.llm_api_key),
+        max_tokens=int(args.llm_max_tokens),
+    )
 
 
 def preview_text(text: str, max_chars: int = 120) -> str:
@@ -94,19 +510,34 @@ def preview_text(text: str, max_chars: int = 120) -> str:
     return s
 
 
-# ── reuse oracle (same rule as DatasetH1H0Judge, exposed for the audit) ─────
+# ── reuse oracle (LLM judge verdict, exposed for the audit) ─────────────────
 
-def reuse_label(query: DatasetRow, anchor: DatasetRow) -> str:
-    """Return 'H1' (reusable), 'H0' (not reusable), or 'UNCERTAIN'.
+# LLM-judge verdict (a JudgeLabel.name) -> H1/H0/UNCERTAIN audit label. The
+# online system serves and learns from these LLM-judge decisions; the audit
+# reads the SAME verdict back instead of the dataset's static H1/H0 rule.
+_JUDGE_LABEL_TO_HYP = {"REUSABLE": "H1", "NOT_REUSABLE": "H0", "UNCERTAIN": "UNCERTAIN"}
 
-    Mirrors `DatasetH1H0Judge`: H1 iff both rows are label==1 and share a
-    global_cluster; UNCERTAIN if either is label==-1; H0 otherwise.
+
+def reuse_label(
+    query: DatasetRow,
+    anchor: DatasetRow,
+    judge_cache: "JudgeDecisionCache | None",
+) -> str:
+    """Reuse label for (query, anchor) taken from the LLM judge's verdict.
+
+    Returns 'H1' (judge said REUSABLE), 'H0' (NOT_REUSABLE) or 'UNCERTAIN'.
+    The served pair is judged by the LLM during online serving (the shadow
+    top-k collector judges every retrieved candidate), so its decision is
+    resident in the shared `JudgeDecisionCache` and read back here with no
+    extra LLM round-trip. A pair the judge never evaluated maps to 'UNCERTAIN'
+    (excluded from active TP/FP, exactly as the old UNKNOWN path was).
     """
-    if query.label == -1 or anchor.label == -1:
+    if judge_cache is None:
         return "UNCERTAIN"
-    if query.label == 1 and anchor.label == 1 and query.group == anchor.group:
-        return "H1"
-    return "H0"
+    cached = judge_cache.get(query.row_id, anchor.row_id)
+    if cached is None:
+        return "UNCERTAIN"
+    return _JUDGE_LABEL_TO_HYP.get(cached[0], "UNCERTAIN")
 
 
 # ── explicit gate wiring with Wilson-safe calibration floor ────────────────
@@ -455,6 +886,8 @@ def run_one_system(
     warmup_stream: list[DatasetRow] | None = None,
     use_wilson: bool = True,
     shared_cache: bool = False,
+    llm_client: LLMClient | None = None,
+    judge_cache: JudgeDecisionCache | None = None,
 ) -> dict[str, Any]:
     # Fresh run: clear any prior persisted state. With --persist the cache still
     # persists *within* this run; we only drop leftovers from earlier runs.
@@ -463,15 +896,19 @@ def run_one_system(
         logger.info("[%s] cleared prior persisted state at %s", method, state_dir)
 
     recorder = MetricsRecorder(method=method, target_fpr=float(target_fpr), logger=logger)
+    llm = llm_client if llm_client is not None else VLLMChatClient()
 
     # min_h0/min_h1 seed the constructor (and the stopping monitor); the refit
     # policy is then overridden with the explicit gates for auditable control.
     system = SemanticCacheSystem(
-        llm=MockLLM(response_template="answer: {prompt}"),
+        llm=llm,
         stream=None,
         scorer=scorer,
         scorers=scorers if scorer == "ensemble" else None,
-                judge=DatasetH1H0Judge(rows_by_id, recorder=recorder, logger=logger if log_judge_details else None),
+        judge=LLMJudgeWithRecorder(
+            llm, rows_by_id, recorder=recorder,
+            logger=logger if log_judge_details else None, judge_cache=judge_cache,
+        ),
         embedding_provider=DatasetEmbeddingProvider(rows_by_id),
         target_fpr=float(target_fpr),
         top_k=int(top_k),
@@ -483,6 +920,10 @@ def run_one_system(
         parallelism=int(parallelism),
         namespace=f"h1h0-online-{method}",
     )
+
+    # Time the scorer's train (fit) and inference (score) latency across every
+    # online refit-promotion. Installed before warm-up so the first fit counts.
+    latency_stats = install_timing_scorer(system)
 
     policy_obj, gate_diag = build_refit_policy(
         min_train_h0=gate_min_train_h0,
@@ -558,9 +999,17 @@ def run_one_system(
     minimal_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = []
     activation_index: int | None = None
+    active_session_start_index: int | None = None
+    active_session_baseline: dict[str, int] | None = None
     first_hit_at: int | None = None
     first_calibrated_at: int | None = None
     audit_anchor_recovery_failures = 0
+
+    initial_policy = snapshot_policy(system)
+    initially_active = initial_policy["trained"] if method == "ensemble" else initial_policy["calibrated"]
+    if initially_active:
+        active_session_start_index = 1
+        active_session_baseline = recorder.count_snapshot()
 
     started = time.time()
     logger.info("[%s] replaying %d requests (scorer=%s)", method, len(stream),
@@ -599,6 +1048,13 @@ def run_one_system(
                         "threshold=%s scorer_v=%d", method, idx,
                         _fmt(policy["threshold"]), policy["scorer_version"])
 
+        policy_active = policy["trained"] if method == "ensemble" else policy["calibrated"]
+        if active_session_baseline is None and policy_active:
+            # The current request was decided with the pre-activation snapshot;
+            # begin active-session accounting with the following request.
+            active_session_start_index = idx + 1
+            active_session_baseline = recorder.count_snapshot()
+
         # Minimal raw decision row for both systems.
         minimal_rows.append({
             "request_index": idx,
@@ -620,7 +1076,7 @@ def run_one_system(
             if anchor_recovery_failed:
                 audit_anchor_recovery_failures += 1
             anchor = rows_by_id.get(anchor_row_id) if anchor_row_id is not None else None
-            oracle_label = reuse_label(row, anchor) if anchor is not None else "UNKNOWN"
+            oracle_label = reuse_label(row, anchor, judge_cache) if anchor is not None else "UNKNOWN"
             is_fp = oracle_label == "H0"
             audit_rows.append({
                 "request_index": idx,
@@ -638,7 +1094,9 @@ def run_one_system(
                 "scorer_state": scorer_state(policy, method=method),
                 "cache_size": len(key_to_row),
                 "candidate_rank": 1,  # served candidate is the top accepted; deeper rank not exposed
-                "post_activation": bool(activation_index is not None and idx >= activation_index),
+                "post_activation": bool(
+                    active_session_start_index is not None and idx >= active_session_start_index
+                ),
                 "anchor_recovery_failed": bool(anchor_recovery_failed),
             })
 
@@ -662,6 +1120,11 @@ def run_one_system(
     final_policy = snapshot_policy(system)
     final_counts = snapshot_training_counts(system)
     shadow_metrics = recorder.metrics()
+    active_session_metrics = (
+        recorder.metrics_since(active_session_baseline)
+        if active_session_baseline is not None
+        else recorder.metrics_since(recorder.count_snapshot())
+    )
     hits = sum(1 for r in minimal_rows if r["source"] == "cache")
     misses = sum(1 for r in minimal_rows if r["source"] == "llm")
 
@@ -689,6 +1152,7 @@ def run_one_system(
         "method": method,
         "scorer": scorer,
         "scorers": scorers,
+        "target_fpr": float(target_fpr),
         "runtime_seconds": runtime,
         "warmup_requests": len(warmup_stream) if warmup_stream else 0,
         "total_requests": len(stream),
@@ -700,6 +1164,7 @@ def run_one_system(
         "first_hit_after_warmup_at_request": first_hit_at,
         "first_calibrated_at_request": first_calibrated_at,
         "activation_request_index": activation_index,
+        "active_session_start_index": active_session_start_index,
         "threshold": final_policy["threshold"],
         "finite_threshold": final_policy["finite_threshold"],
         "scorer_version": final_policy["scorer_version"],
@@ -726,11 +1191,28 @@ def run_one_system(
         "active_true_positives": active_tp,
         "active_false_positives": active_fp,
         "active_uncertain": len(audit_rows) - len(active),
-        "active_fp_rate": safe_rate(active_fp, active_tp + active_fp),
+        "active_fdr": safe_rate(active_fp, active_tp + active_fp),
+        "active_fpr": active_session_metrics["empirical_fpr"],
+        "active_fpr_budget_gap": (
+            None if active_session_metrics["empirical_fpr"] is None
+            else float(target_fpr) - float(active_session_metrics["empirical_fpr"])
+        ),
+        "active_fpr_budget_utilization": (
+            None if active_session_metrics["empirical_fpr"] is None
+            else float(active_session_metrics["empirical_fpr"]) / float(target_fpr)
+        ),
+        "active_target_fpr_respected": active_session_metrics["target_fpr_respected"],
+        "active_tpr": active_session_metrics["tpr"],
+        "active_precision": active_session_metrics["precision"],
+        "active_true_accepts": active_session_metrics["true_accepts"],
+        "active_false_accepts": active_session_metrics["false_accepts"],
+        "active_true_rejects": active_session_metrics["true_rejects"],
+        "active_false_rejects": active_session_metrics["false_rejects"],
         "post_activation_active_hits": len(post),
         "post_activation_false_positives": post_fp,
         "post_activation_true_positives": post_tp,
-        "post_activation_fp_rate": safe_rate(post_fp, post_tp + post_fp),
+        "post_activation_fdr": safe_rate(post_fp, post_tp + post_fp),
+        "post_activation_fpr": active_session_metrics["empirical_fpr"],
         "audit_anchor_recovery_failures": audit_anchor_recovery_failures,
         "gate_diagnostics": gate_diag.__dict__,
         "calibration_vs_active": calib_diag,
@@ -739,7 +1221,16 @@ def run_one_system(
             h1_total=final_counts["h1_total"],
             required_h1=int(gate_min_train_h1) + int(gate_min_calib_h1),
         ),
+        # Scorer train (fit) + inference (score) latency for this method.
+        "latency": latency_stats.snapshot(),
     }
+    lat = summary["latency"]
+    logger.info(
+        "[%s] latency: inference avg=%s ms over %d score calls; "
+        "train avg=%s s over %d fits",
+        method, _fmt(lat["inference"]["avg_ms"], 4), lat["inference"]["calls"],
+        _fmt(lat["train"]["avg_seconds"], 4), lat["train"]["fits"],
+    )
     system._executor.shutdown(wait=False)
     return {"summary": summary, "minimal_rows": minimal_rows, "audit_rows": audit_rows,
             "gate_diag": gate_diag, "calib_diag": calib_diag}
@@ -894,8 +1385,10 @@ def build_fp_diagnosis(ensemble: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "shadow_empirical_fpr": summary["shadow_empirical_fpr"],
-        "active_fp_rate": summary["active_fp_rate"],
-        "post_activation_fp_rate": summary["post_activation_fp_rate"],
+        "active_fpr": summary["active_fpr"],
+        "active_fdr": summary["active_fdr"],
+        "post_activation_fpr": summary["post_activation_fpr"],
+        "post_activation_fdr": summary["post_activation_fdr"],
         "fpr_disagreement": _fpr_disagreement(summary),
         "timing": timing,
         "concentration": concentration,
@@ -907,16 +1400,16 @@ def build_fp_diagnosis(ensemble: dict[str, Any]) -> dict[str, Any]:
 
 def _fpr_disagreement(summary: dict[str, Any]) -> dict[str, Any]:
     shadow = summary["shadow_empirical_fpr"]
-    active = summary["active_fp_rate"]
+    active = summary["active_fpr"]
     diff = (active - shadow) if (shadow is not None and active is not None) else None
     return {
         "shadow_empirical_fpr": shadow,
-        "active_hit_fp_rate": active,
+        "active_fpr": active,
         "difference": diff,
-        "note": ("active-hit FP rate exceeds the shadow/calibration FPR -> the "
-                 "serving decision is accepting hard H0 pairs the calibration set "
-                 "did not penalize" if (diff is not None and diff > 0.02)
-                 else "shadow and active FP rates are consistent"),
+        "note": ("active-session FPR exceeds the whole-replay shadow FPR; "
+                 "cold-start rejections were depressing the whole-replay rate"
+                 if (diff is not None and diff > 0.02)
+                 else "whole-replay and active-session FPR are consistent"),
     }
 
 
@@ -1048,7 +1541,7 @@ def _rate(num: int, den: int) -> dict[str, Any]:
 def aggregate_anchor_diagnostics(records: list[AnchorDiagRecord]) -> dict[str, Any]:
     """Pure aggregation of per-request records into raw counts + derived rates.
 
-    Every rate carries its numerator and denominator. `active_fp_rate` and
+    Every rate carries its numerator and denominator. `active_fdr` and
     `active_precision` are deliberately built from the SAME judged-served-hit
     population (active_tp + active_fp == active_judged_hits) so they cannot
     silently disagree.
@@ -1126,7 +1619,7 @@ def aggregate_anchor_diagnostics(records: list[AnchorDiagRecord]) -> dict[str, A
         "scorer_tpr_given_gold_anchor": _rate(accepted_gold, accepted_gold + rejected_gold),
         "wrong_anchor_accept_rate": _rate(accepted_wrong, accepted_wrong + rejected_wrong),
         "active_precision": _rate(active_tp, active_tp + active_fp),
-        "active_fp_rate": _rate(active_fp, active_judged_hits),
+        "active_fdr": _rate(active_fp, active_judged_hits),
         "active_hit_rate": _rate(served_hits, total),
         "online_candidate_empirical_fpr": _rate(online_candidate_accepted_h0, online_candidate_evaluated_h0),
     }
@@ -1277,6 +1770,8 @@ def replay_with_anchor_capture(
     use_wilson: bool = True,
     warmup_stream: list[DatasetRow] | None = None,
     require_activation: bool = False,
+    llm_client: LLMClient | None = None,
+    judge_cache: "JudgeDecisionCache | None" = None,
 ) -> tuple[list[AnchorDiagRecord], dict[str, Any]]:
     """Replay the REAL online path, capturing the decision-time top-k and the
     served anchor per request so each can be compared against the gold NP anchor.
@@ -1299,12 +1794,15 @@ def replay_with_anchor_capture(
         logger.info("[%s] cleared prior persisted state at %s", method, state_dir)
 
     recorder = MetricsRecorder(method=method, target_fpr=float(target_fpr), logger=logger)
+    llm = llm_client if llm_client is not None else VLLMChatClient()
     system = SemanticCacheSystem(
-        llm=MockLLM(response_template="answer: {prompt}"),
+        llm=llm,
         stream=None,
         scorer=scorer,
         scorers=scorers if scorer == "ensemble" else None,
-        judge=DatasetH1H0Judge(rows_by_id, recorder=recorder, logger=None),
+        judge=LLMJudgeWithRecorder(
+            llm, rows_by_id, recorder=recorder, logger=None, judge_cache=judge_cache,
+        ),
         embedding_provider=DatasetEmbeddingProvider(rows_by_id),
         target_fpr=float(target_fpr),
         top_k=int(top_k),
@@ -1470,7 +1968,7 @@ def replay_with_anchor_capture(
             cand_row = rows_by_id.get(cand_rid) if cand_rid is not None else None
             if cand_row is None:
                 continue
-            if reuse_label(row, cand_row) != "H0":
+            if reuse_label(row, cand_row, judge_cache) != "H0":
                 continue
             evaluated_h0_candidates += 1
             feats_c = oracle.feature_builder.build(query_emb_t, _emb_tuple(cand_row))
@@ -1510,9 +2008,9 @@ def replay_with_anchor_capture(
         )
 
         retrieved_row = rows_by_id.get(retrieved_rid) if retrieved_rid is not None else None
-        gold_pair_label = reuse_label(row, gold_row) if gold_row is not None else "UNKNOWN"
+        gold_pair_label = reuse_label(row, gold_row, judge_cache) if gold_row is not None else "UNKNOWN"
         if retrieved_row is not None:
-            retrieved_pair_label = reuse_label(row, retrieved_row)
+            retrieved_pair_label = reuse_label(row, retrieved_row, judge_cache)
         elif served_hit or top1_rid is not None:
             retrieved_pair_label = "UNKNOWN"
         else:
@@ -1747,6 +2245,18 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
         logger.info("warm-up stream length=%d (seed offset +1e6) selection=%s",
                     len(warmup_stream), warmup_selection_diag.get("mode"))
 
+    llm_client = build_llm_client(args)
+    logger.info("LLM backend: model=%s base_url=%s", llm_client.model, llm_client.base_url)
+
+    judge_cache: JudgeDecisionCache | None = None
+    if not bool(getattr(args, "no_judge_cache", False)):
+        cache_path = (
+            Path(args.judge_cache_path) if getattr(args, "judge_cache_path", None)
+            else out_dir / "judge_cache.jsonl"
+        )
+        judge_cache = JudgeDecisionCache(cache_path, logger=logger)
+        logger.info("judge decision cache: %s (%d pre-loaded)", cache_path, judge_cache.stats()["size"])
+
     records, final_policy = replay_with_anchor_capture(
         method=args.diag_scorer, scorer=args.diag_scorer, scorers=diag_scorers,
         stream=stream, rows_by_id=rows_by_id,
@@ -1757,6 +2267,7 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
         parallelism=int(args.parallelism), persistence=bool(args.persist),
         state_dir=out_dir / "state", logger=logger, progress_every=int(args.progress_every),
         use_wilson=use_wilson, warmup_stream=warmup_stream, require_activation=require_activation,
+        llm_client=llm_client, judge_cache=judge_cache,
     )
 
     metrics = aggregate_anchor_diagnostics(records)
@@ -1787,9 +2298,9 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
     logger.info("gold_availability=%s top1_gold=%s topk_recall=%s",
                 _rate_str(rt["gold_anchor_cache_availability_rate"]),
                 _rate_str(rt["top1_gold_match_rate"]), _rate_str(rt["topk_gold_recall"]))
-    logger.info("active_tp=%d active_fp=%d active_precision=%s active_fp_rate=%s",
+    logger.info("active_tp=%d active_fp=%d active_precision=%s active_fdr=%s",
                 rc["active_tp"], rc["active_fp"],
-                _rate_str(rt["active_precision"]), _rate_str(rt["active_fp_rate"]))
+                _rate_str(rt["active_precision"]), _rate_str(rt["active_fdr"]))
     logger.info("scorer_tpr_given_gold_anchor=%s  dominant_active_fp_bucket=%s",
                 _rate_str(rt["scorer_tpr_given_gold_anchor"]), metrics["dominant_active_fp_bucket"])
     logger.info("online_candidate_empirical_fpr=%s (accepted_h0=%d / evaluated_h0=%d)",
@@ -1816,9 +2327,14 @@ _SUMMARY_CSV_FIELDS = [
     "method", "total_requests", "hits", "misses", "hit_rate",
     "shadow_empirical_fpr", "shadow_tpr", "shadow_precision",
     "active_hits", "active_true_positives", "active_false_positives",
-    "active_fp_rate", "post_activation_fp_rate", "audit_anchor_recovery_failures",
-    "threshold", "activation_request_index", "trained", "calibrated",
+    "active_fpr", "active_fdr", "active_tpr", "active_precision",
+    "active_fpr_budget_gap", "active_fpr_budget_utilization",
+    "post_activation_fpr", "post_activation_fdr",
+    "audit_anchor_recovery_failures", "threshold", "activation_request_index",
+    "active_session_start_index", "trained", "calibrated",
     "train_h0", "train_h1", "calibration_h0", "calibration_h1",
+    "inference_avg_ms", "inference_calls",
+    "train_avg_seconds", "train_fits",
 ]
 
 
@@ -1835,6 +2351,8 @@ def write_artifacts(out_dir: Path, cosine: dict[str, Any], ensemble: dict[str, A
             "delta_hit_rate": _delta(es["hit_rate"], cs["hit_rate"]),
             "delta_shadow_fpr": _delta(es["shadow_empirical_fpr"], cs["shadow_empirical_fpr"]),
             "delta_shadow_tpr": _delta(es["shadow_tpr"], cs["shadow_tpr"]),
+            "delta_active_fpr": _delta(es["active_fpr"], cs["active_fpr"]),
+            "delta_active_tpr": _delta(es["active_tpr"], cs["active_tpr"]),
             "ensemble_improves_over_cosine": _improvement_verdict(cs, es),
         },
     }
@@ -1881,7 +2399,17 @@ def write_artifacts(out_dir: Path, cosine: dict[str, Any], ensemble: dict[str, A
 
 
 def _summary_csv_row(method: str, s: dict[str, Any]) -> dict[str, Any]:
-    return {k: (method if k == "method" else s.get(k)) for k in _SUMMARY_CSV_FIELDS}
+    lat = s.get("latency") or {}
+    flat = {
+        "inference_avg_ms": (lat.get("inference") or {}).get("avg_ms"),
+        "inference_calls": (lat.get("inference") or {}).get("calls"),
+        "train_avg_seconds": (lat.get("train") or {}).get("avg_seconds"),
+        "train_fits": (lat.get("train") or {}).get("fits"),
+    }
+    return {
+        k: (method if k == "method" else flat[k] if k in flat else s.get(k))
+        for k in _SUMMARY_CSV_FIELDS
+    }
 
 
 def _delta(a: Any, b: Any) -> Any:
@@ -1893,18 +2421,69 @@ def _delta(a: Any, b: Any) -> Any:
 def _improvement_verdict(cs: dict[str, Any], es: dict[str, Any]) -> str:
     if not es["trained"] or es["activation_request_index"] is None:
         return "inconclusive: ensemble never activated its learned scorer"
-    e_fpr, c_fpr = es["shadow_empirical_fpr"], cs["shadow_empirical_fpr"]
-    e_tpr, c_tpr = es["shadow_tpr"], cs["shadow_tpr"]
+    target = float(es["target_fpr"])
+    e_fpr, c_fpr = es["active_fpr"], cs["active_fpr"]
+    e_tpr, c_tpr = es["active_tpr"], cs["active_tpr"]
     if None in (e_fpr, c_fpr, e_tpr, c_tpr):
         return "inconclusive: FPR/TPR not computable for both systems"
+    e_feasible = float(e_fpr) <= target
+    c_feasible = float(c_fpr) <= target
+    if e_feasible and not c_feasible:
+        return "yes: ensemble is the only method satisfying the active FPR budget"
+    if c_feasible and not e_feasible:
+        return "no: cosine is the only method satisfying the active FPR budget"
+    if e_feasible and c_feasible:
+        if float(e_tpr) > float(c_tpr) + 1e-9:
+            return "yes: both satisfy the active FPR budget; ensemble has higher active TPR"
+        if float(c_tpr) > float(e_tpr) + 1e-9:
+            return "no: both satisfy the active FPR budget; cosine has higher active TPR"
+        return "tie: both satisfy the active FPR budget with equal active TPR"
     if e_fpr <= c_fpr + 1e-9 and e_tpr >= c_tpr - 1e-9 and (e_tpr > c_tpr or e_fpr < c_fpr):
-        return "yes: ensemble dominates (>= TPR at <= FPR)"
+        return "neither satisfies budget; ensemble dominates on active FPR/TPR"
     if e_tpr > c_tpr and e_fpr > c_fpr:
-        return "mixed: ensemble higher TPR but also higher FPR"
+        return "neither satisfies budget; ensemble has higher active TPR and FPR"
     if e_tpr < c_tpr and e_fpr < c_fpr:
-        return ("mixed: ensemble more conservative than cosine "
-                "(lower TPR and lower FPR)")
-    return "no: ensemble does not improve over cosine on this stream"
+        return "neither satisfies budget; ensemble has lower active TPR and FPR"
+    return "neither method satisfies the active FPR budget"
+
+
+# ── per-system result checkpointing (resume after timeout/GPU death) ────────
+
+RESULT_CHECKPOINT_VERSION = 2
+
+
+def _save_system_checkpoint(path: Path, result: dict[str, Any]) -> None:
+    """Persist exactly the fields `write_artifacts`/`build_fp_diagnosis` need.
+
+    `run_one_system` also returns the `gate_diag`/`calib_diag` objects, but those
+    are already mirrored into `summary` and never read directly downstream, so we
+    only serialize the JSON-safe `summary`, `minimal_rows`, and `audit_rows`.
+    Written atomically (tmp + replace) so a kill mid-write can't corrupt it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": RESULT_CHECKPOINT_VERSION,
+        "summary": result["summary"],
+        "minimal_rows": result["minimal_rows"],
+        "audit_rows": result["audit_rows"],
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_system_checkpoint(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if int(payload.get("version", 0)) != RESULT_CHECKPOINT_VERSION:
+        raise ValueError(
+            f"checkpoint version {payload.get('version', 0)!r} is incompatible with "
+            f"required version {RESULT_CHECKPOINT_VERSION}"
+        )
+    return {
+        "summary": payload["summary"],
+        "minimal_rows": payload["minimal_rows"],
+        "audit_rows": payload["audit_rows"],
+    }
 
 
 # ── orchestration ──────────────────────────────────────────────────────────
@@ -2010,8 +2589,37 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     logger.info("shared-cache write-through (fair A/B, identical retrieval pool): %s",
                 "ON (--shared-cache)" if shared_cache else "OFF (each scorer builds its own cache)")
 
+    llm_client = build_llm_client(args)
+    logger.info("LLM backend: model=%s base_url=%s", llm_client.model, llm_client.base_url)
+
+    # Resume support: a disk-backed LLM-judge cache (the dominant cost) makes any
+    # re-run after a timeout/GPU death replay at pure-Python speed, and a
+    # per-system result checkpoint lets a resubmitted job skip systems that
+    # already finished. Both live under out_dir, so pointing a resubmitted job at
+    # the SAME --output-dir resumes it. --no-judge-cache / --no-resume disable.
+    judge_cache: JudgeDecisionCache | None = None
+    if not bool(getattr(args, "no_judge_cache", False)):
+        cache_path = (
+            Path(args.judge_cache_path) if getattr(args, "judge_cache_path", None)
+            else out_dir / "judge_cache.jsonl"
+        )
+        judge_cache = JudgeDecisionCache(cache_path, logger=logger)
+        logger.info("judge decision cache: %s (%d pre-loaded)", cache_path, judge_cache.stats()["size"])
+    resume = not bool(getattr(args, "no_resume", False))
+
     results: dict[str, dict[str, Any]] = {}
     for method, scorer, scs in (("ensemble", "ensemble", scorers), ("cosine", "cosine", None)):
+        checkpoint = out_dir / method / "result_checkpoint.json"
+        if resume and checkpoint.exists():
+            try:
+                results[method] = _load_system_checkpoint(checkpoint)
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("[%s] ignoring incompatible checkpoint %s: %s",
+                               method, checkpoint, exc)
+            else:
+                logger.info("[%s] resume: loaded completed system from %s (skipping replay)",
+                            method, checkpoint)
+                continue
         results[method] = run_one_system(
             method=method, scorer=scorer, scorers=scs,
             stream=stream, rows_by_id=rows_by_id,
@@ -2026,18 +2634,27 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             warmup_stream=warmup_stream,
             use_wilson=use_wilson,
             shared_cache=shared_cache,
+            llm_client=llm_client,
+            judge_cache=judge_cache,
         )
+        # Checkpoint the completed system immediately so a later timeout cannot
+        # cost us a finished system's work (write_artifacts only runs once BOTH
+        # systems are done).
+        _save_system_checkpoint(checkpoint, results[method])
+        logger.info("[%s] checkpointed completed system -> %s", method, checkpoint)
+        if judge_cache is not None:
+            logger.info("[%s] judge cache now holds %d decisions", method, judge_cache.stats()["size"])
 
     write_artifacts(out_dir, results["cosine"], results["ensemble"], config)
 
     cs, es = results["cosine"]["summary"], results["ensemble"]["summary"]
     logger.info("=== RESULT ===")
-    logger.info("cosine  : hit_rate=%s shadow_fpr=%s shadow_tpr=%s active_fp_rate=%s",
+    logger.info("cosine  : hit_rate=%s shadow_fpr=%s active_fpr=%s active_tpr=%s active_fdr=%s",
                 _fmt(cs["hit_rate"]), _fmt(cs["shadow_empirical_fpr"]),
-                _fmt(cs["shadow_tpr"]), _fmt(cs["active_fp_rate"]))
-    logger.info("ensemble: hit_rate=%s shadow_fpr=%s shadow_tpr=%s active_fp_rate=%s activated@%s",
+                _fmt(cs["active_fpr"]), _fmt(cs["active_tpr"]), _fmt(cs["active_fdr"]))
+    logger.info("ensemble: hit_rate=%s shadow_fpr=%s active_fpr=%s active_tpr=%s active_fdr=%s activated@%s",
                 _fmt(es["hit_rate"]), _fmt(es["shadow_empirical_fpr"]),
-                _fmt(es["shadow_tpr"]), _fmt(es["active_fp_rate"]),
+                _fmt(es["active_fpr"]), _fmt(es["active_tpr"]), _fmt(es["active_fdr"]),
                 es["activation_request_index"])
     logger.info("ensemble_improves_over_cosine: %s", _improvement_verdict(cs, es))
     logger.info("artifacts -> %s", str(out_dir.resolve()))
@@ -2064,6 +2681,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "ensemble caches hold the IDENTICAL set of rows and cosine-NN retrieves the same "
                         "candidates for both -- a fair A/B where only the accept/reject decision differs. "
                         "Default: OFF (each scorer's hit/miss decisions shape its own cache).")
+    p.add_argument("--judge-cache-path", dest="judge_cache_path", default=None,
+                   help="compare mode: path to the persistent LLM-judge decision cache "
+                        "(JSONL). Default: <output-dir>/judge_cache.jsonl. Re-running with the "
+                        "same path replays previously judged pairs with NO LLM call, so a job "
+                        "killed by a timeout/GPU death resumes at pure-Python speed.")
+    p.add_argument("--no-judge-cache", dest="no_judge_cache", action="store_true",
+                   help="compare mode: disable the persistent judge-decision cache (every pair "
+                        "is re-judged by the LLM). Default: cache ON.")
+    p.add_argument("--no-resume", dest="no_resume", action="store_true",
+                   help="compare mode: ignore per-system result checkpoints and re-run every "
+                        "system from scratch. Default: resume (skip systems already checkpointed "
+                        "in --output-dir).")
     p.add_argument("--npz", default=str(ROOT.parent / "data" / "h1h0_final.npz"))
     p.add_argument("--output-dir", default=None, help="Default: timestamped experiments/ dir.")
     p.add_argument("--query-field", default="text")
@@ -2104,7 +2733,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--persist", action="store_true",
                    help="Persist within the run (cleared at run start). Default: in-memory.")
     p.add_argument("--log-judge-details", action="store_true",
-                   help="Log per-call DatasetH1H0Judge start/finish lines (verbose). Default: off.")
+                   help="Log per-call LLM judge start/finish lines (verbose). Default: off.")
+    p.add_argument("--llm-base-url", default=os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1"),
+                   help="OpenAI-compatible base URL of the vLLM server backing both response "
+                        "generation and the LLM-as-judge. Default: http://localhost:8000/v1 "
+                        "(env VLLM_BASE_URL).")
+    p.add_argument("--llm-model", default=os.environ.get("VLLM_MODEL", "Qwen/Qwen3-8B-AWQ"),
+                   help="Model name served by vLLM. Default: Qwen/Qwen3-8B-AWQ (env VLLM_MODEL).")
+    p.add_argument("--llm-api-key", default=os.environ.get("VLLM_API_KEY", "local-vllm-token"),
+                   help="API key for the vLLM server. Default: env VLLM_API_KEY or 'local-vllm-token'.")
+    p.add_argument("--llm-max-tokens", type=int, default=64,
+                   help="Max tokens for both LLM responses and judge replies. Default: 64.")
     return p.parse_args(argv)
 
 

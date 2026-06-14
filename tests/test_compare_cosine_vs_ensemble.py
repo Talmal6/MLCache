@@ -24,6 +24,8 @@ for _p in (str(SRC), str(SCRIPTS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from mlcache.feedback import JudgeLabel
+
 try:
     from compare_cosine_vs_ensemble import (  # type: ignore[import]
         PROGRESS_CSV_FIELDS,
@@ -106,6 +108,30 @@ def test_metrics_recorder_metrics_has_required_keys():
     # With no data, rates are None (never faked).
     assert m["empirical_fpr"] is None
     assert m["tpr"] is None
+
+
+@skip_no_harness
+def test_metrics_since_excludes_cold_start_true_negatives():
+    rec = MetricsRecorder(method="cosine", target_fpr=0.10, logger=logging.getLogger("t"))
+
+    rec.set_request_index(1)
+    rec.record_judge(candidate_key="cold", judge_label=JudgeLabel.NOT_REUSABLE)
+    rec.resolve_request(1, source="llm", accepted_key=None)
+    baseline = rec.count_snapshot()
+
+    rec.set_request_index(2)
+    rec.record_judge(candidate_key="fp", judge_label=JudgeLabel.NOT_REUSABLE)
+    rec.resolve_request(2, source="cache", accepted_key="fp")
+
+    rec.set_request_index(3)
+    rec.record_judge(candidate_key="tn", judge_label=JudgeLabel.NOT_REUSABLE)
+    rec.resolve_request(3, source="llm", accepted_key=None)
+
+    active = rec.metrics_since(baseline)
+    assert active["false_accepts"] == 1
+    assert active["true_rejects"] == 1
+    assert active["empirical_fpr"] == pytest.approx(0.5)
+    assert rec.metrics()["empirical_fpr"] == pytest.approx(1 / 3)
 
 
 @skip_no_harness

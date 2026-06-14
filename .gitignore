@@ -2,3 +2,72 @@ runs/
 __pycache__/
 *.py[cod]
 *$py.class
+logs/
+
+mlcache_llm_replay_*
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# Build/package outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Slurm / HPC output files
+*.out
+*.err
+slurm-*.out
+mlcache_llm_replay_*
+replay_experiment_array.sbatch_*.out
+replay_experiment_array.sbatch_*.err
+
+# Experiment generated outputs
+runs/
+
+# Local datasets / generated artifacts
+data/*.npz
+data/*.npy
+data/*.faiss
+data/*.pkl
+data/*.pickle
+data/*.joblib
+data/*.jsonl
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# Experiment generated outputs
+runs/
+experiments/*/
+
+# Keep top-level experiment scripts trackable
+!experiments/*.py
+!experiments/*.sbatch
