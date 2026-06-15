@@ -112,11 +112,18 @@ class VLLMChatClient:
     api_key: str = "local-vllm-token"
     temperature: float = 0.0
     max_tokens: int = 64
+    timeout_seconds: float = 1800.0
+    max_retries: int = 0
 
     def __post_init__(self) -> None:
         from openai import OpenAI
 
-        self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+        self._client = OpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout_seconds,
+            max_retries=self.max_retries,
+        )
 
     def generate(self, prompt: str, **kwargs: Any) -> LLMResponse:
         completion = self._client.chat.completions.create(
@@ -496,6 +503,8 @@ def build_llm_client(args: argparse.Namespace) -> VLLMChatClient:
         model=str(args.llm_model),
         api_key=str(args.llm_api_key),
         max_tokens=int(args.llm_max_tokens),
+        timeout_seconds=float(args.llm_timeout_seconds),
+        max_retries=int(args.llm_max_retries),
     )
 
 
@@ -2246,7 +2255,11 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
                     len(warmup_stream), warmup_selection_diag.get("mode"))
 
     llm_client = build_llm_client(args)
-    logger.info("LLM backend: model=%s base_url=%s", llm_client.model, llm_client.base_url)
+    logger.info(
+        "LLM backend: model=%s base_url=%s timeout_seconds=%s max_retries=%d",
+        llm_client.model, llm_client.base_url,
+        llm_client.timeout_seconds, llm_client.max_retries,
+    )
 
     judge_cache: JudgeDecisionCache | None = None
     if not bool(getattr(args, "no_judge_cache", False)):
@@ -2744,6 +2757,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="API key for the vLLM server. Default: env VLLM_API_KEY or 'local-vllm-token'.")
     p.add_argument("--llm-max-tokens", type=int, default=64,
                    help="Max tokens for both LLM responses and judge replies. Default: 64.")
+    p.add_argument("--llm-timeout-seconds", type=float, default=1800.0,
+                   help="Per-request timeout for the local vLLM API. Default: 1800 seconds.")
+    p.add_argument("--llm-max-retries", type=int, default=0,
+                   help="OpenAI client retries after a failed vLLM request. Default: 0 to avoid "
+                        "overlapping long-running generations.")
     return p.parse_args(argv)
 
 

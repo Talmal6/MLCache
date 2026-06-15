@@ -1,5 +1,0 @@
-{
-  "error": "NPZ missing required label_field='h0h1'; available fields: ('text', 'label', 'meta', 'emb', 'emb_umap', 'global_cluster')",
-  "reason": "dataset_schema_invalid",
-  "status": "failed"
-}

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -326,132 +327,52 @@ def write_job_script(job: ReplayJob, python_bin: str, vllm_cfg: dict | None = No
 
 # ── file writing ────────────────────────────────────────────────────────────
 
-def _timestamp() -> str:
-    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def _best_stdout(cmd: list[str], cwd: Path | None = None) -> str:
-    try:
-        return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "NA"
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {k: _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    return value
+def _default_exp_root(args: argparse.Namespace) -> Path:
+    """Return a stable directory for one exact experiment configuration."""
+    config = {
+        "suite": args.suite,
+        "seeds": args.seeds,
+        "target_fprs": args.target_fprs,
+        "selections": args.selections,
+        "scorers_list": args.scorers_list,
+        "modes": args.modes,
+        "npz": str(Path(args.npz).resolve()),
+        "max_requests": args.max_requests,
+        "cache_size": args.cache_size,
+        "warmup_requests": args.warmup_requests,
+        "top_k": args.top_k,
+        "batch_size": args.batch_size,
+        "min_train_h0": args.min_train_h0,
+        "min_train_h1": args.min_train_h1,
+        "min_calib_h0": args.min_calib_h0,
+        "min_calib_h1": args.min_calib_h1,
+        "shared_cache": args.shared_cache,
+        "use_wilson": args.use_wilson,
+        "persist": args.persist,
+        "vllm_model": args.vllm_model,
+    }
+    encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:12]
+    return REPO_ROOT / "runs" / f"replay_{args.suite}_{digest}"
 
 
 def write_files(
     exp_root: Path,
-    tasks: list[ReplayTask],
     jobs: list[ReplayJob],
     python_bin: str,
     args: argparse.Namespace,
     vllm_cfg: dict | None = None,
-) -> tuple[Path, Path]:
+) -> Path:
     (exp_root / "slurm").mkdir(parents=True, exist_ok=True)
     (exp_root / "jobs").mkdir(parents=True, exist_ok=True)
-    (exp_root / "tasks").mkdir(parents=True, exist_ok=True)
-
-    git_sha = _best_stdout(["git", "rev-parse", "HEAD"], REPO_ROOT)
-    py_version = _best_stdout([python_bin, "-c", "import sys; print(sys.version.replace('\\n',' '))"])
 
     commands_file = exp_root / "commands.txt"
-    commands_tsv = exp_root / "commands.tsv"
-
-    fieldnames = ["job_id", "mode", "target_fpr", "selection", "scorers",
-                  "seeds", "seed_count", "job_dir", "command"]
-
-    with commands_file.open("w", encoding="utf-8") as cmd_f, \
-         commands_tsv.open("w", encoding="utf-8", newline="") as tsv_f:
-        writer = csv.DictWriter(tsv_f, fieldnames=fieldnames, delimiter="\t")
-        writer.writeheader()
+    with commands_file.open("w", encoding="utf-8") as cmd_f:
         for job in jobs:
             script = write_job_script(job, python_bin, vllm_cfg=vllm_cfg)
-            command = "bash " + shlex.quote(str(script))
-            cmd_f.write(command + "\n")
-            first = job.tasks[0]
-            writer.writerow({
-                "job_id": job.job_id,
-                "mode": first.mode,
-                "target_fpr": f"{first.target_fpr:.4g}",
-                "selection": first.selection,
-                "scorers": first.scorers,
-                "seeds": _job_seed_text(job),
-                "seed_count": len(job.tasks),
-                "job_dir": str(job.output_dir),
-                "command": command,
-            })
-            (job.output_dir / "job_config.json").write_text(
-                json.dumps(_jsonable({
-                    "job_id": job.job_id,
-                    "seeds": [int(t.seed) for t in job.tasks],
-                    "git_sha": git_sha,
-                    "python_bin": python_bin,
-                    "python_version": py_version,
-                    "script": str(script),
-                    "first_task": {
-                        "mode": first.mode, "target_fpr": first.target_fpr,
-                        "selection": first.selection, "scorers": first.scorers,
-                    },
-                }), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            cmd_f.write("bash " + shlex.quote(str(script)) + "\n")
 
-    # Per-task config files
-    tasks_tsv = exp_root / "tasks.tsv"
-    task_fieldnames = ["task_id", "seed", "target_fpr", "selection", "scorers",
-                       "mode", "max_requests", "cache_size", "output_dir", "command"]
-    with tasks_tsv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=task_fieldnames, delimiter="\t")
-        writer.writeheader()
-        for task in tasks:
-            task.output_dir.mkdir(parents=True, exist_ok=True)
-            cmd = task_to_command_line(python_bin, task)
-            writer.writerow({
-                "task_id": task.task_id, "seed": task.seed,
-                "target_fpr": f"{task.target_fpr:.4g}",
-                "selection": task.selection, "scorers": task.scorers,
-                "mode": task.mode, "max_requests": task.max_requests,
-                "cache_size": task.cache_size,
-                "output_dir": str(task.output_dir), "command": cmd,
-            })
-            (task.output_dir / "task_config.json").write_text(
-                json.dumps(_jsonable({
-                    "task_id": task.task_id, "seed": task.seed,
-                    "target_fpr": task.target_fpr, "selection": task.selection,
-                    "scorers": task.scorers, "mode": task.mode,
-                    "max_requests": task.max_requests, "cache_size": task.cache_size,
-                    "warmup_requests": task.warmup_requests,
-                    "progress_every": task.progress_every,
-                    "top_k": task.top_k, "batch_size": task.batch_size,
-                    "min_train_h0": task.min_train_h0, "min_train_h1": task.min_train_h1,
-                    "min_calib_h0": task.min_calib_h0, "min_calib_h1": task.min_calib_h1,
-                    "output_dir": str(task.output_dir),
-                    "npz_path": str(task.npz_path),
-                    "extra_flags": list(task.extra_flags),
-                    "git_sha": git_sha, "python_bin": python_bin,
-                }), indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-
-    manifest = {
-        "launcher_args": _jsonable(vars(args)),
-        "git_sha": git_sha,
-        "timestamp": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "total_tasks": len(tasks),
-        "total_jobs": len(jobs),
-    }
-    (exp_root / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    return commands_file, commands_tsv
+    return commands_file
 
 
 # ── SLURM submission ────────────────────────────────────────────────────────
@@ -747,7 +668,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     # Output
     add("--exp-root", default=None,
-        help="Experiment root directory. Default: runs/replay_<timestamp>.")
+        help="Experiment root directory. Default: stable runs/replay_<suite>_<config-hash>.")
 
     # Python / conda
     add("--conda-env", default=os.environ.get("CONDA_ENV_NAME", "mlcache"),
@@ -777,6 +698,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Port to use when starting the vLLM server.")
     add("--vllm-startup-timeout", type=int, default=600,
         help="Seconds to wait for vLLM to become ready before aborting.")
+    add("--llm-timeout-seconds", type=float, default=1800.0,
+        help="Per-request timeout passed to the replay's local vLLM client.")
+    add("--llm-max-retries", type=int, default=0,
+        help="OpenAI client retries after a failed vLLM request.")
 
     # Control flow
     add("--dry-run", action="store_true",
@@ -815,7 +740,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _apply_suite(args)
 
-    exp_root = Path(args.exp_root) if args.exp_root else REPO_ROOT / "runs" / f"replay_{_timestamp()}"
+    exp_root = Path(args.exp_root) if args.exp_root else _default_exp_root(args)
 
     extra_flags: list[str] = []
     if args.shared_cache:
@@ -824,6 +749,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         extra_flags.append("--use-wilson")
     if args.persist:
         extra_flags.append("--persist")
+    extra_flags.extend([
+        "--llm-timeout-seconds", str(args.llm_timeout_seconds),
+        "--llm-max-retries", str(args.llm_max_retries),
+    ])
 
     all_tasks = build_replay_suite(
         exp_root,
@@ -900,7 +829,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         print(f"vLLM guard enabled: base_url={vllm_cfg['base_url']}  model={vllm_cfg['model']}")
 
-    commands_file, _ = write_files(exp_root, remaining, jobs, python_bin, args, vllm_cfg=vllm_cfg)
+    commands_file = write_files(exp_root, jobs, python_bin, args, vllm_cfg=vllm_cfg)
     print(f"Experiment root: {exp_root}")
     print(f"Commands file:   {commands_file}")
 

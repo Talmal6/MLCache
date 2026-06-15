@@ -332,6 +332,24 @@ def test_array_paper_defaults_match_run_llm_replay_sbatch():
     assert args.vllm_model == "Qwen/Qwen3-8B-AWQ"
     assert args.vllm_api_key == "local-vllm-token"
     assert args.vllm_startup_timeout == 600
+    assert args.llm_timeout_seconds == 1800.0
+    assert args.llm_max_retries == 0
+
+
+def test_array_default_exp_root_is_stable_and_config_specific():
+    first = submit.parse_args([])
+    submit._apply_suite(first)
+    second = submit.parse_args([])
+    submit._apply_suite(second)
+    changed = submit.parse_args(["--max-requests", "39999"])
+    submit._apply_suite(changed)
+    operational_change = submit.parse_args(["--llm-timeout-seconds", "2400"])
+    submit._apply_suite(operational_change)
+
+    assert submit._default_exp_root(first) == submit._default_exp_root(second)
+    assert submit._default_exp_root(first) == submit._default_exp_root(operational_change)
+    assert submit._default_exp_root(first) != submit._default_exp_root(changed)
+    assert submit._default_exp_root(first).name.startswith("replay_paper_")
 
 
 def test_array_task_command_includes_progress_cadence(tmp_path):
@@ -354,12 +372,17 @@ def test_array_task_command_includes_progress_cadence(tmp_path):
         min_calib_h0=args.min_calib_h0,
         min_calib_h1=args.min_calib_h1,
         npz_path=submit.DEFAULT_NPZ,
-        extra_flags=(),
+        extra_flags=(
+            "--llm-timeout-seconds", str(args.llm_timeout_seconds),
+            "--llm-max-retries", str(args.llm_max_retries),
+        ),
     )
     command = submit.task_to_cli_args(tasks[0], "python")
 
     assert command[command.index("--progress-every") + 1] == "100"
     assert command[command.index("--warmup-requests") + 1] == "4000"
+    assert command[command.index("--llm-timeout-seconds") + 1] == "1800.0"
+    assert command[command.index("--llm-max-retries") + 1] == "0"
 
 
 @skip_no_sklearn
