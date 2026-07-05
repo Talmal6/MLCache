@@ -1,11 +1,17 @@
 """Correctness-controlled online semantic cache contracts."""
 
 from mlcache.cache import (
+    CacheEvictionPolicy,
     CacheGatewayResult,
+    EvictionEntryMetadata,
+    EvictionPolicyName,
     ExternalSemanticCache,
+    FIFOEvictionPolicy,
     FileKVStore,
     InMemoryKVStore,
     KVStore,
+    LFUEvictionPolicy,
+    LRUEvictionPolicy,
     MySQLKVStore,
     MySQLSemanticCacheGateway,
     PostgresKVStore,
@@ -13,6 +19,7 @@ from mlcache.cache import (
     SQLiteKVStore,
     SQLiteSemanticCacheGateway,
     SemanticCacheGateway,
+    build_eviction_policy,
 )
 from mlcache.calibration import (
     CalibrationExample,
@@ -144,6 +151,7 @@ from mlcache.retrieval import (
     VectorStore,
 )
 from mlcache.runtime import (
+    EvictionRuntimeConfig,
     MLCacheRuntime,
     MLCacheRuntimeConfig,
     QueryLevelRuntimeConfig,
@@ -199,6 +207,7 @@ __all__ = [
     "CachedLLM",
     "CachedLLMResponse",
     "CacheEntry",
+    "CacheEvictionPolicy",
     "CacheGatewayResult",
     "CacheKey",
     "CacheLookup",
@@ -214,10 +223,14 @@ __all__ = [
     "Embedding",
     "EmbeddingProvider",
     "EnsembleScorer",
+    "EvictionEntryMetadata",
+    "EvictionPolicyName",
+    "EvictionRuntimeConfig",
     "ExternalSemanticCache",
     "FallbackFirstPolicy",
     "FaissOutboxIndexer",
     "FaissVectorStore",
+    "FIFOEvictionPolicy",
     "FileKVStore",
     "FileQueryCalibrationRecordStore",
     "FileQueryLevelShadowDecisionStore",
@@ -239,6 +252,8 @@ __all__ = [
     "InMemoryThresholdProvider",
     "InMemoryVectorStore",
     "InputSpace",
+    "LFUEvictionPolicy",
+    "LRUEvictionPolicy",
     "JudgeDecision",
     "JudgeLabel",
     "JudgeRequest",
@@ -358,6 +373,7 @@ __all__ = [
     "VectorStore",
     "WindowedOnlineStoppingController",
     "XGBoostScorer",
+    "build_eviction_policy",
     "build_local_mlcache_runtime",
     "build_mlcache_runtime",
     "wilson_upper_bound",

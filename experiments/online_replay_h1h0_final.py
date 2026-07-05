@@ -784,6 +784,48 @@ def build_stream(
     raise ValueError(f"Unknown --selection mode: {selection!r}")
 
 
+def build_warmup_stream_disjoint(
+    rows: list[DatasetRow], *, measured_stream: list[DatasetRow], warmup_requests: int,
+    seed: int, selection: str, reuse_clusters_top_k: int, reuse_min_cluster_size: int,
+    mixed_reuse_fraction: float,
+) -> tuple[list[DatasetRow], dict[str, Any]]:
+    """Build a warm-up stream drawn ONLY from rows the measured stream never uses.
+
+    Warm-up is a burn-in that trains/calibrates the scorer before the measured
+    "check" replay; it MUST be held out from the measured set. Otherwise (because
+    `build_stream_uniform` returns a deterministic `rows[:n]` prefix and ignores
+    the seed whenever `n <= len(universe)`) the warm-up stream is just a prefix of
+    the measured stream, so the measured queries are dominated by exact-duplicate
+    hits of already-cached warm-up rows rather than genuine held-out traffic.
+
+    We exclude every measured row-id from the warm-up pool, then build the warm-up
+    stream from the remainder with the requested selection. This guarantees
+    disjoint row sets for every selection mode (not only the uniform-prefix case).
+    The measured stream is left exactly as the caller built it.
+    """
+    measured_ids = {r.row_id for r in measured_stream}
+    warmup_pool = [r for r in rows if r.row_id not in measured_ids]
+    if len(warmup_pool) == 0:
+        raise ValueError(
+            "No rows left for a warm-up stream disjoint from the measured stream "
+            f"(universe={len(rows)}, measured distinct={len(measured_ids)}). "
+            "Increase --cache-size or lower --max-requests."
+        )
+    warmup_stream, diag = build_stream(
+        warmup_pool, max_requests=int(warmup_requests), seed=int(seed),
+        selection=selection, reuse_clusters_top_k=reuse_clusters_top_k,
+        reuse_min_cluster_size=reuse_min_cluster_size, mixed_reuse_fraction=mixed_reuse_fraction,
+    )
+    diag = {
+        **diag,
+        "disjoint_from_measured": True,
+        "warmup_pool_size": len(warmup_pool),
+        "warmup_distinct_rows": len({r.row_id for r in warmup_stream}),
+        "overlap_with_measured": len({r.row_id for r in warmup_stream} & measured_ids),
+    }
+    return warmup_stream, diag
+
+
 def scorer_state(policy: dict[str, Any], *, method: str) -> str:
     """Map lifecycle flags to untrained / global / learned."""
     if not policy["calibrated"]:
@@ -895,8 +937,10 @@ def run_one_system(
     warmup_stream: list[DatasetRow] | None = None,
     use_wilson: bool = True,
     shared_cache: bool = False,
+    freeze_after_warmup: bool = False,
     llm_client: LLMClient | None = None,
     judge_cache: JudgeDecisionCache | None = None,
+    calibration_fraction: float | None = None,
 ) -> dict[str, Any]:
     # Fresh run: clear any prior persisted state. With --persist the cache still
     # persists *within* this run; we only drop leftovers from earlier runs.
@@ -928,7 +972,13 @@ def run_one_system(
         persistence=bool(persistence),
         parallelism=int(parallelism),
         namespace=f"h1h0-online-{method}",
+        calibration_fraction=calibration_fraction,
     )
+    if calibration_fraction is not None:
+        logger.info(
+            "[%s] train/calibration split: %.0f%% train / %.0f%% calibration (per label)",
+            method, 100.0 * (1.0 - calibration_fraction), 100.0 * calibration_fraction,
+        )
 
     # Time the scorer's train (fit) and inference (score) latency across every
     # online refit-promotion. Installed before warm-up so the first fit counts.
@@ -1001,9 +1051,28 @@ def run_one_system(
             method, wp["trained"], wp["calibrated"], _fmt(wp["threshold"]), wp["scorer_version"],
             wc["h0_train"], wc["h1_train"], wc["h0_calibration"], wc["h1_calibration"],
         )
+        _log_warmup_training_metrics(
+            system, recorder=recorder, threshold=wp["threshold"], method=method, logger=logger,
+        )
         recorder.reset()
 
     _assert_not_frozen_before_measurement(system, method)
+
+    # --freeze-after-warmup: stop online retraining/recalibration for the
+    # measured replay. Serving + shadow-judging continue (the audit still gets
+    # its LLM-judge labels), but the scorer and NP threshold are pinned to their
+    # post-warm-up state, so the measured phase reports a single fixed model
+    # instead of one that keeps churning as new pairs arrive. Set auto_refit
+    # directly (not system.freeze()) so the _frozen flag stays False and the
+    # convergence-freeze invariant above remains a meaningful check.
+    if freeze_after_warmup:
+        system.cache.runtime.oracle.auto_refit = False
+        fp = snapshot_policy(system)
+        logger.info(
+            "[%s] freeze-after-warmup: auto-refit DISABLED for measured replay "
+            "(frozen at scorer_v=%d threshold=%s trained=%s calibrated=%s)",
+            method, fp["scorer_version"], _fmt(fp["threshold"]), fp["trained"], fp["calibrated"],
+        )
 
     minimal_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = []
@@ -1164,6 +1233,7 @@ def run_one_system(
         "target_fpr": float(target_fpr),
         "runtime_seconds": runtime,
         "warmup_requests": len(warmup_stream) if warmup_stream else 0,
+        "freeze_after_warmup": bool(freeze_after_warmup),
         "total_requests": len(stream),
         "hits": hits,
         "misses": misses,
@@ -1301,6 +1371,110 @@ def _dist(arr: np.ndarray) -> dict[str, Any]:
         "p75": float(np.percentile(arr, 75)),
         "max": float(np.max(arr)),
     }
+
+
+def _threshold_metrics_on_rows(
+    rows: tuple[Any, ...],
+    *,
+    scorer: SemanticScorer,
+    threshold: float | None,
+    tie_mode: TieMode,
+) -> dict[str, Any]:
+    """Score `rows` (judged-pair examples) with `scorer` and report the accept
+    rate at `threshold`.
+
+    Used to surface the in-sample FPR (on H0 rows) and TPR (on H1 rows) the
+    *frozen* end-of-warm-up model achieves on its OWN train/calibration buckets,
+    so the training-set rate can be contrasted with the measured-stream rate.
+    `at_threshold` counts rows whose score sits exactly on the cut (the size of
+    the point mass the NP threshold landed on -- the ensemble's saturates at 1.0).
+    """
+    feats = [ex.features for ex in rows if getattr(ex, "features", None)]
+    if not feats or threshold is None:
+        return {"n": len(feats), "accept_rate": None, "at_threshold": None}
+    scores = np.asarray(score_rows_with_scorer(feats, scorer), dtype=np.float64)
+    tau = float(threshold)
+    accepted = scores > tau if tie_mode == TieMode.GT else scores >= tau
+    return {
+        "n": int(scores.size),
+        "accept_rate": float(np.mean(accepted)),
+        "at_threshold": int(np.sum(np.isclose(scores, tau))),
+    }
+
+
+def _log_warmup_training_metrics(
+    system: SemanticCacheSystem,
+    *,
+    recorder: MetricsRecorder,
+    threshold: float | None,
+    method: str,
+    logger,
+) -> None:
+    """Log the end-of-warm-up training-set FPR/TPR alongside the warm-up serving
+    FPR/TPR, before `recorder.reset()` discards the warm-up counts.
+
+    Two complementary views:
+      - serving: FPR/TPR the system actually produced while replaying the warm-up
+        stream (LLM-judge labelled, exactly what the measured replay reports later).
+      - train/calib buckets: the FROZEN scorer's accept rate on its OWN H0 (FPR)
+        and H1 (TPR) buckets at the activated threshold -- the in-sample rate the
+        NP threshold was fit to. A train/calib FPR ~= target with a measured FPR
+        far above it is the calibration-vs-online generalization gap.
+    """
+    sm = recorder.metrics()
+    logger.info(
+        "[%s] warm-up SERVING metrics (warm-up stream, judge-labelled): "
+        "fpr=%s tpr=%s precision=%s (TP=%s FP=%s TN=%s FN=%s)",
+        method, _fmt(sm["empirical_fpr"], 4), _fmt(sm["tpr"], 4), _fmt(sm["precision"], 4),
+        sm["true_accepts"], sm["false_accepts"], sm["true_rejects"], sm["false_rejects"],
+    )
+
+    oracle = system.cache.runtime.oracle
+    store = system.cache.runtime.judge_training_store
+    scorer = oracle.scorer
+    tie_mode = getattr(oracle, "tie_mode", TieMode.GE)
+
+    # Log the activated ensemble's component weights (post warm-up). Wrapped in
+    # try/except so diagnostics never crash the run for a non-ensemble scorer.
+    try:
+        members = scorer.members() if hasattr(scorer, "members") else None
+        weights = scorer.weights if hasattr(scorer, "weights") else None
+        if members is not None and weights is not None:
+            pairs = ", ".join(
+                f"{str(m.name)}={_fmt(w, 4)}" for m, w in zip(members, weights)
+            )
+            logger.info("[%s] warm-up ensemble weights: %s", method, pairs)
+    except Exception as exc:  # diagnostics must never crash the run
+        logger.info("[%s] warm-up ensemble weights unavailable: %s", method, exc)
+    if store is None:
+        logger.info("[%s] warm-up TRAINING metrics: no judge_training_store available", method)
+        return
+    try:
+        calib_h0 = _threshold_metrics_on_rows(
+            store.h0_calibration(), scorer=scorer, threshold=threshold, tie_mode=tie_mode)
+        calib_h1 = _threshold_metrics_on_rows(
+            store.h1_calibration(), scorer=scorer, threshold=threshold, tie_mode=tie_mode)
+        train_h0 = _threshold_metrics_on_rows(
+            store.h0_train(), scorer=scorer, threshold=threshold, tie_mode=tie_mode)
+        train_h1 = _threshold_metrics_on_rows(
+            store.h1_train(), scorer=scorer, threshold=threshold, tie_mode=tie_mode)
+    except Exception as exc:  # diagnostics must never crash the run
+        logger.info("[%s] warm-up TRAINING metrics unavailable: %s", method, exc)
+        return
+    logger.info(
+        "[%s] warm-up CALIBRATION-set metrics @thr=%s: fpr(H0)=%s [n=%d, at_thr=%d] "
+        "tpr(H1)=%s [n=%d, at_thr=%d]",
+        method, _fmt(threshold, 4),
+        _fmt(calib_h0["accept_rate"], 4), calib_h0["n"], calib_h0["at_threshold"] or 0,
+        _fmt(calib_h1["accept_rate"], 4), calib_h1["n"], calib_h1["at_threshold"] or 0,
+    )
+    logger.info(
+        "[%s] warm-up TRAIN-set metrics @thr=%s: fpr(H0)=%s [n=%d, at_thr=%d] "
+        "tpr(H1)=%s [n=%d, at_thr=%d]",
+        method, _fmt(threshold, 4),
+        _fmt(train_h0["accept_rate"], 4), train_h0["n"], train_h0["at_threshold"] or 0,
+        _fmt(train_h1["accept_rate"], 4), train_h1["n"], train_h1["at_threshold"] or 0,
+    )
 
 
 # ── FP diagnosis report (Step 7) ───────────────────────────────────────────
@@ -1779,6 +1953,7 @@ def replay_with_anchor_capture(
     use_wilson: bool = True,
     warmup_stream: list[DatasetRow] | None = None,
     require_activation: bool = False,
+    freeze_after_warmup: bool = False,
     llm_client: LLMClient | None = None,
     judge_cache: "JudgeDecisionCache | None" = None,
 ) -> tuple[list[AnchorDiagRecord], dict[str, Any]]:
@@ -1849,6 +2024,7 @@ def replay_with_anchor_capture(
         "warmup_calib_h0": 0, "warmup_calib_h1": 0,
         "threshold_after_warmup": None, "scorer_version_after_warmup": 0,
         "activated_before_measurement": False,
+        "freeze_after_warmup": bool(freeze_after_warmup),
     }
 
     # ---- warm-up / activation phase (excluded from measured records) ----
@@ -1896,6 +2072,7 @@ def replay_with_anchor_capture(
             "wilson_upper_fpr": activation_status.get("wilson_upper_fpr"),
             "allowed_fpr_bound": activation_status.get("allowed_fpr_bound"),
             "threshold_is_finite": activation_status.get("threshold_is_finite"),
+            "freeze_after_warmup": bool(freeze_after_warmup),
         }
         logger.info(
             "[%s] warm-up complete: trained=%s calibrated=%s threshold_after_warmup=%s "
@@ -1935,6 +2112,19 @@ def replay_with_anchor_capture(
             )
 
     _assert_not_frozen_before_measurement(system, method)
+
+    # --freeze-after-warmup: pin the scorer + NP threshold for the measured
+    # phase (serving + shadow-judging continue; only auto-refit stops). See the
+    # matching note in run_one_system.
+    if freeze_after_warmup:
+        oracle.auto_refit = False
+        fp = snapshot_policy(system)
+        warmup_diag["freeze_after_warmup"] = True
+        logger.info(
+            "[%s] freeze-after-warmup: auto-refit DISABLED for measured replay "
+            "(frozen at scorer_v=%d threshold=%s trained=%s calibrated=%s)",
+            method, fp["scorer_version"], _fmt(fp["threshold"]), fp["trained"], fp["calibrated"],
+        )
 
     logger.info("[%s] anchor-diagnostic replay of %d MEASURED requests (scorer=%s, top_k=%d)",
                 method, len(stream), ",".join(scorers) if scorers else scorer, top_k)
@@ -2245,14 +2435,16 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
                     warmup_requests)
     warmup_stream: list[DatasetRow] | None = None
     if warmup_requests > 0:
-        warmup_stream, warmup_selection_diag = build_stream(
-            rows, max_requests=warmup_requests, seed=int(args.seed) + 1_000_000,
+        warmup_stream, warmup_selection_diag = build_warmup_stream_disjoint(
+            rows, measured_stream=stream, warmup_requests=warmup_requests,
+            seed=int(args.seed) + 1_000_000,
             selection=str(args.selection), reuse_clusters_top_k=int(args.reuse_clusters_top_k),
             reuse_min_cluster_size=int(args.reuse_min_cluster_size),
             mixed_reuse_fraction=float(args.mixed_reuse_fraction),
         )
-        logger.info("warm-up stream length=%d (seed offset +1e6) selection=%s",
-                    len(warmup_stream), warmup_selection_diag.get("mode"))
+        logger.info("warm-up stream length=%d distinct=%d overlap_with_measured=%d selection=%s",
+                    len(warmup_stream), warmup_selection_diag["warmup_distinct_rows"],
+                    warmup_selection_diag["overlap_with_measured"], warmup_selection_diag.get("mode"))
 
     llm_client = build_llm_client(args)
     logger.info(
@@ -2280,6 +2472,7 @@ def run_retrieved_anchor_diagnostics(args: argparse.Namespace) -> dict[str, Any]
         parallelism=int(args.parallelism), persistence=bool(args.persist),
         state_dir=out_dir / "state", logger=logger, progress_every=int(args.progress_every),
         use_wilson=use_wilson, warmup_stream=warmup_stream, require_activation=require_activation,
+        freeze_after_warmup=bool(getattr(args, "freeze_after_warmup", False)),
         llm_client=llm_client, judge_cache=judge_cache,
     )
 
@@ -2518,7 +2711,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     logger.info("ensemble_scorers: %s", ",".join(scorers))
     for k in ("selection", "reuse_clusters_top_k", "reuse_min_cluster_size",
               "mixed_reuse_fraction", "target_fpr", "min_train_h0", "min_train_h1",
-              "min_calib_h0", "min_calib_h1", "seed", "max_requests", "cache_size",
+              "min_calib_h0", "min_calib_h1", "calibration_fraction", "seed", "max_requests", "cache_size",
               "top_k", "batch_size", "parallelism", "persist"):
         logger.info("%s: %s", k, getattr(args, k))
 
@@ -2559,15 +2752,18 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     warmup_stream: list[DatasetRow] | None = None
     warmup_selection_diag: dict[str, Any] | None = None
     if int(args.warmup_requests) > 0:
-        warmup_stream, warmup_selection_diag = build_stream(
-            rows, max_requests=int(args.warmup_requests), seed=int(args.seed) + 1_000_000,
+        warmup_stream, warmup_selection_diag = build_warmup_stream_disjoint(
+            rows, measured_stream=stream, warmup_requests=int(args.warmup_requests),
+            seed=int(args.seed) + 1_000_000,
             selection=str(args.selection),
             reuse_clusters_top_k=int(args.reuse_clusters_top_k),
             reuse_min_cluster_size=int(args.reuse_min_cluster_size),
             mixed_reuse_fraction=float(args.mixed_reuse_fraction),
         )
-        logger.info("warm-up stream length=%d (cache universe=%d) selection=%s",
-                    len(warmup_stream), len(rows), warmup_selection_diag)
+        logger.info("warm-up stream length=%d distinct=%d overlap_with_measured=%d "
+                    "(cache universe=%d) selection=%s",
+                    len(warmup_stream), warmup_selection_diag["warmup_distinct_rows"],
+                    warmup_selection_diag["overlap_with_measured"], len(rows), warmup_selection_diag)
 
     selection = {
         "mode": args.selection,
@@ -2647,8 +2843,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             warmup_stream=warmup_stream,
             use_wilson=use_wilson,
             shared_cache=shared_cache,
+            freeze_after_warmup=bool(getattr(args, "freeze_after_warmup", False)),
             llm_client=llm_client,
             judge_cache=judge_cache,
+            calibration_fraction=(
+                cf if (cf := getattr(args, "calibration_fraction", None)) and cf > 0 else None
+            ),
         )
         # Checkpoint the completed system immediately so a later timeout cannot
         # cost us a finished system's work (write_artifacts only runs once BOTH
@@ -2729,6 +2929,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-train-h1", type=int, default=10)
     p.add_argument("--min-calib-h0", type=int, default=20)
     p.add_argument("--min-calib-h1", type=int, default=5)
+    p.add_argument("--calibration-fraction", dest="calibration_fraction", type=float, default=0.4,
+                   help="Fraction of judged pairs routed to the calibration bucket (the rest go "
+                        "to train), applied per label during warm-up and measured replay. "
+                        "0.4 = 60%% train / 40%% calibration. The NP threshold is fit on the "
+                        "calibration bucket, so a larger calibration share tightens FPR control. "
+                        "Default: 0.4. Set <=0 to fall back to the batch-size modulo split.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--warmup-requests", type=int, default=0,
                    help="Replay this many extra requests (same selection, different seed) "
@@ -2736,6 +2942,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "ensemble's first refit/activation can be reached before timing "
                         "starts. Warm-up traffic is excluded from reported metrics. "
                         "Default: 0 (disabled).")
+    p.add_argument("--freeze-after-warmup", dest="freeze_after_warmup", action="store_true",
+                   help="After warm-up, disable online retraining/recalibration: the measured "
+                        "replay serves on a FIXED scorer + NP threshold (the post-warm-up model) "
+                        "instead of one that keeps refitting as new pairs arrive. Serving and "
+                        "shadow-judging still run (so the active-hit audit keeps its labels); only "
+                        "the auto-refit loop is switched off. Pairs only with --warmup-requests > 0.")
     p.add_argument("--max-requests", type=int, default=2000)
     p.add_argument("--cache-size", type=int, default=2000)
     p.add_argument("--top-k", type=int, default=5)

@@ -12,6 +12,45 @@ from mlcache.calibration.wilson import wilson_upper_bound
 from mlcache.semantic_types import CacheKey, OracleDecisionStatus, Query, Score, Threshold, TieMode
 
 
+def threshold_from_selected_h0_scores(
+    scores: Sequence[Score],
+    *,
+    target_false_accept_rate: float,
+    tie_mode: TieMode = TieMode.GE,
+) -> Threshold | None:
+    """Smallest tie-exact threshold whose selected-H0 accept rate is <= the budget.
+
+    Neyman-Pearson thresholding on selected-candidate H0 scores: returns the
+    ``1 - target_false_accept_rate`` quantile computed so that no more than
+    ``floor(target * n)`` H0 scores are accepted under ``tie_mode``. Returns
+    ``None`` for an empty score list. Shared by batch query-level calibration and
+    the online ACI controller so both compute an identical threshold.
+    """
+
+    if not scores:
+        return None
+    values = sorted((float(score) for score in scores), reverse=True)
+    allowed_accepts = floor(float(target_false_accept_rate) * len(values))
+    allowed_accepts = max(0, min(int(allowed_accepts), len(values)))
+
+    if tie_mode == TieMode.GE:
+        if allowed_accepts == 0:
+            return Threshold(nextafter(values[0], float("inf")))
+        boundary = values[allowed_accepts - 1]
+        accepts_at_boundary = sum(1 for value in values if value >= boundary)
+        if accepts_at_boundary <= allowed_accepts:
+            return Threshold(boundary)
+        return Threshold(nextafter(boundary, float("inf")))
+
+    if allowed_accepts == 0:
+        return Threshold(values[0])
+    boundary = values[allowed_accepts - 1]
+    accepts_if_including_boundary = sum(1 for value in values if value >= boundary)
+    if accepts_if_including_boundary <= allowed_accepts:
+        return Threshold(nextafter(boundary, float("-inf")))
+    return Threshold(boundary)
+
+
 @dataclass(frozen=True, slots=True)
 class QueryLevelCalibrationConfig:
     target_false_accept_rate: float = 0.05
@@ -284,28 +323,11 @@ class DefaultQueryLevelCalibrationBuilder(QueryLevelCalibrator):
         scores: Sequence[Score],
         config: QueryLevelCalibrationConfig,
     ) -> Threshold | None:
-        if not scores:
-            return None
-        values = sorted((float(score) for score in scores), reverse=True)
-        allowed_accepts = floor(float(config.target_false_accept_rate) * len(values))
-        allowed_accepts = max(0, min(int(allowed_accepts), len(values)))
-
-        if config.tie_mode == TieMode.GE:
-            if allowed_accepts == 0:
-                return Threshold(nextafter(values[0], float("inf")))
-            boundary = values[allowed_accepts - 1]
-            accepts_at_boundary = sum(1 for value in values if value >= boundary)
-            if accepts_at_boundary <= allowed_accepts:
-                return Threshold(boundary)
-            return Threshold(nextafter(boundary, float("inf")))
-
-        if allowed_accepts == 0:
-            return Threshold(values[0])
-        boundary = values[allowed_accepts - 1]
-        accepts_if_including_boundary = sum(1 for value in values if value >= boundary)
-        if accepts_if_including_boundary <= allowed_accepts:
-            return Threshold(nextafter(boundary, float("-inf")))
-        return Threshold(boundary)
+        return threshold_from_selected_h0_scores(
+            scores,
+            target_false_accept_rate=config.target_false_accept_rate,
+            tie_mode=config.tie_mode,
+        )
 
     @staticmethod
     def _accept_count(scores: Sequence[Score], threshold: Threshold | None, tie_mode: TieMode) -> int:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 
-from mlcache.cache import KVStore, SemanticCacheGateway
+from mlcache.cache import KVStore, SemanticCacheGateway, build_eviction_policy
 from mlcache.calibration import QueryCalibrationRecordBuilder, QueryCalibrationRecordStore, ThresholdProvider
 from mlcache.features import PairFeatureBuilder
 from mlcache.feedback import (
@@ -75,6 +75,7 @@ def build_mlcache_runtime(
                 top_k=runtime_config.shadow.top_k,
                 max_pairs_per_request=runtime_config.shadow.max_pairs_per_request,
                 calibration_every_n=runtime_config.shadow.calibration_every_n,
+                calibration_fraction=runtime_config.shadow.calibration_fraction,
                 collect_uncertain=runtime_config.shadow.collect_uncertain,
             ),
             query_record_builder=QueryCalibrationRecordBuilder() if query_record_store is not None else None,
@@ -130,11 +131,23 @@ def build_mlcache_runtime(
         target_false_accept_rate=runtime_config.refit.target_false_accept_rate,
         top_k=runtime_config.refit.top_k,
     )
-    gateway = (
-        gateway_factory(kv_store, oracle)
-        if gateway_factory is not None
-        else SemanticCacheGateway(kv_store=kv_store, oracle=oracle)
-    )
+    if gateway_factory is not None:
+        # Backend-owned gateways (Postgres/MySQL/SQLite) manage their own storage
+        # lifecycle, so capacity-based eviction is not applied to them here.
+        gateway = gateway_factory(kv_store, oracle)
+    else:
+        eviction_config = runtime_config.eviction
+        eviction_policy = (
+            build_eviction_policy(eviction_config.policy)
+            if eviction_config.max_entries is not None
+            else None
+        )
+        gateway = SemanticCacheGateway(
+            kv_store=kv_store,
+            oracle=oracle,
+            eviction_policy=eviction_policy,
+            max_entries=eviction_config.max_entries,
+        )
 
     return MLCacheRuntime(
         gateway=gateway,

@@ -52,7 +52,7 @@ from mlcache.policies import (
     QueryLevelShadowDecisionStore,
 )
 from mlcache.retrieval import FaissVectorStore, FileVectorStore, InMemoryVectorStore, VectorStore
-from mlcache.runtime.config import MLCacheRuntimeConfig, StorageRuntimeConfig
+from mlcache.runtime.config import EvictionRuntimeConfig, MLCacheRuntimeConfig, StorageRuntimeConfig
 from mlcache.runtime.factory import build_mlcache_runtime
 from mlcache.runtime.runtime import MLCacheRuntime
 from mlcache.scorers import SemanticScorer
@@ -74,6 +74,7 @@ def build_local_mlcache_runtime(
     runtime_config = config or MLCacheRuntimeConfig()
     storage_config = _resolve_storage_config(runtime_config.storage)
     runtime_config = replace(runtime_config, storage=storage_config)
+    runtime_config = replace(runtime_config, eviction=_resolve_eviction_config(runtime_config.eviction))
     if storage_config.top_k is not None:
         runtime_config = replace(
             runtime_config,
@@ -202,6 +203,14 @@ def _resolve_storage_config(config: StorageRuntimeConfig) -> StorageRuntimeConfi
         faiss_metric=env.faiss_metric if config.faiss_metric == "cosine" else config.faiss_metric,
         faiss_shard_id=env.faiss_shard_id if config.faiss_shard_id == "default" else config.faiss_shard_id,
         top_k=config.top_k if config.top_k is not None else env.top_k,
+    )
+
+
+def _resolve_eviction_config(config: EvictionRuntimeConfig) -> EvictionRuntimeConfig:
+    env = EvictionRuntimeConfig.from_env()
+    return EvictionRuntimeConfig(
+        policy=config.policy if config.policy != "lru" else env.policy,
+        max_entries=config.max_entries if config.max_entries is not None else env.max_entries,
     )
 
 

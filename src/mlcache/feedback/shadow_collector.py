@@ -24,6 +24,13 @@ class ShadowCollectionConfig:
     top_k: int = 5
     max_pairs_per_request: int | None = None
     calibration_every_n: int = 5
+    # Optional exact train/calibration split. When set (e.g. 0.4 = 40% of
+    # judged pairs to the calibration bucket, 60% to train), the collector
+    # assigns each new pair to whichever bucket keeps the running calibration
+    # ratio closest to this target — per label. This supports arbitrary
+    # fractions that the integer `calibration_every_n` modulo cannot express
+    # (40% would need every-2.5th). When None, the modulo rule is used.
+    calibration_fraction: float | None = None
     collect_uncertain: bool = False
     include_served_candidate: bool = True
     include_unserved_candidates: bool = True
@@ -113,6 +120,9 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         self._failures = 0
         self._h0_split_count = 0
         self._h1_split_count = 0
+        # Per-label calibration-bucket counts, used by the fraction-based split.
+        self._h0_calib_count = 0
+        self._h1_calib_count = 0
 
     def collect(
         self,
@@ -401,16 +411,32 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
         )
 
     def _next_split(self, label: JudgeLabel) -> str:
+        frac = self.config.calibration_fraction
         with self._lock:
             if label == JudgeLabel.REUSABLE:
                 self._h1_split_count += 1
-                count = self._h1_split_count
+                seen = self._h1_split_count
+                calib = self._h1_calib_count
             else:
                 self._h0_split_count += 1
-                count = self._h0_split_count
-        if count % self.config.calibration_every_n == 0:
-            return "calibration"
-        return "train"
+                seen = self._h0_split_count
+                calib = self._h0_calib_count
+
+            if frac is not None:
+                # Send this pair to calibration if doing so keeps the running
+                # calibration ratio at or below the target fraction — i.e. while
+                # the bucket is under-filled relative to `frac`. This converges
+                # to an exact `frac` calibration / `1-frac` train split per label.
+                to_calibration = calib < frac * seen
+            else:
+                to_calibration = seen % self.config.calibration_every_n == 0
+
+            if to_calibration:
+                if label == JudgeLabel.REUSABLE:
+                    self._h1_calib_count += 1
+                else:
+                    self._h0_calib_count += 1
+        return "calibration" if to_calibration else "train"
 
     def _store_example(
         self,
@@ -466,6 +492,10 @@ class DefaultShadowTopKCollector(ShadowTopKCollector):
             raise ValueError("max_pairs_per_request must be non-negative when set")
         if self.config.calibration_every_n <= 0:
             raise ValueError("calibration_every_n must be positive")
+        if self.config.calibration_fraction is not None and not (
+            0.0 < self.config.calibration_fraction < 1.0
+        ):
+            raise ValueError("calibration_fraction must be in (0, 1) when set")
 
     @staticmethod
     def _features_to_tuple(features: PairFeatures) -> tuple[float, ...]:

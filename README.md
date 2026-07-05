@@ -29,6 +29,34 @@ Trainable scorers (`lda`, `xgboost`, `mlp`, and `ensemble`) need
 optional ML dependencies aren't installed, `prefit` raises a clear
 `ImportError` telling you to run `pip install -e '.[ml,dev]'`.
 
+## Eviction policy
+
+When you bound the cache with `max_entries`, an eviction policy decides which
+entry to drop once that bound is exceeded. This is independent of the semantic
+HIT/MISS decision (the scorer still owns reuse) — it only governs which already
+admitted entry is removed to make room.
+
+```python
+cache = MLCache.from_preset(
+    root_dir="cache_state",
+    scorer="cosine",
+    threshold=0.05,
+    eviction_policy="lru",   # "lru" | "lfu" | "fifo"
+    max_entries=10_000,       # unbounded (no eviction) when omitted
+)
+```
+
+- `lru` — evict the least *recently used* entry.
+- `lfu` — evict the least *frequently used* entry.
+- `fifo` — evict the oldest *inserted* entry.
+
+Each entry tracks `created_at`/insertion order, `last_accessed`, and
+`access_count`; a cache HIT refreshes recency and frequency. The same options
+are available via env vars (`MLCACHE_EVICTION_POLICY`, `MLCACHE_MAX_ENTRIES`)
+and the smoke CLI (`--eviction-policy`, `--max-entries`). See
+`scripts/run_eviction_policy_example.py` for a runnable demonstration of all
+three policies.
+
 ## Persistent storage
 
 The default runtime still uses the existing in-memory or JSON file stores. For

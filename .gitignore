@@ -68,7 +68,13 @@ data/*.jsonl
 
 # Experiment generated outputs
 runs/
+runs_adaptive/
 experiments/*/
+
+# Caches accidentally written under the repo root (vLLM/HF/XDG)
+.cache/
+.hf_cache/
+experiments/judge_cache_shared.jsonl
 
 # Keep top-level experiment scripts trackable
 !experiments/*.py

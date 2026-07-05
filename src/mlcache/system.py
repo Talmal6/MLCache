@@ -121,6 +121,7 @@ class SemanticCacheSystem:
         namespace: str | None = "semantic-cache-system",
         persistence: bool = True,
         stopping_config: OnlineStoppingConfig | None = None,
+        calibration_fraction: float | None = None,
     ) -> None:
         self.llm = llm
         self.stream = stream
@@ -167,8 +168,19 @@ class SemanticCacheSystem:
         # gives a 50/50 split, but setting min_train_h1=min_h1 would demand all
         # min_h1 pairs in the train bucket even though half go to calibration).
         _cal_every_n = max(1, self.batch_size // 10)
-        _train_frac = (_cal_every_n - 1) / _cal_every_n if _cal_every_n > 1 else 1.0
-        _cal_frac = 1.0 - _train_frac
+        if calibration_fraction is not None:
+            # Explicit train/calibration split (e.g. 0.4 = 40% calibration,
+            # 60% train). The shadow collector honours this exactly per label;
+            # the gate thresholds below are sized off the same fraction so the
+            # activation gate can actually be satisfied.
+            if not (0.0 < float(calibration_fraction) < 1.0):
+                raise ValueError("calibration_fraction must be in (0, 1) when set")
+            _cal_frac = float(calibration_fraction)
+            _train_frac = 1.0 - _cal_frac
+        else:
+            _train_frac = (_cal_every_n - 1) / _cal_every_n if _cal_every_n > 1 else 1.0
+            _cal_frac = 1.0 - _train_frac
+        self._calibration_fraction = calibration_fraction
 
         # Wilson-safe minimum for min_calibration_h0: the activation gate uses
         # the Wilson upper bound on empirical FPR; with k=0 false accepts the
@@ -197,6 +209,7 @@ class SemanticCacheSystem:
                     enabled=True,
                     top_k=self.top_k,
                     calibration_every_n=_cal_every_n,
+                    calibration_fraction=calibration_fraction,
                 ),
                 refit=RuntimeRefitConfig(
                     auto_refit=True,

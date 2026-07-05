@@ -13,6 +13,7 @@ from mlcache.calibration import ThresholdScope
 from mlcache.embeddings import SentenceTransformersEmbeddingProvider
 from mlcache.features import NormalizedHadamardFeatureBuilder
 from mlcache.runtime import build_local_mlcache_runtime
+from mlcache.runtime.config import EvictionRuntimeConfig, MLCacheRuntimeConfig
 from mlcache.scorers import CosineScorer
 from mlcache.semantic_types import CacheEntry, CacheKey, CacheLookup, CacheMetadata, Query, Response, Threshold
 
@@ -37,6 +38,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--incoming-query", default=DEFAULT_INCOMING_QUERY)
     parser.add_argument("--persist", default=None)
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument(
+        "--eviction-policy",
+        choices=["lru", "lfu", "fifo"],
+        default="lru",
+        help="Which entry to evict when the cache is full.",
+    )
+    parser.add_argument(
+        "--max-entries",
+        type=int,
+        default=None,
+        help="Cache capacity bound; eviction runs once exceeded. Unbounded if omitted.",
+    )
     return parser.parse_args(tokens)
 
 
@@ -66,6 +79,9 @@ def _run_smoke_with_root(
         root_dir=root_dir,
         feature_builder=NormalizedHadamardFeatureBuilder(),
         scorer=CosineScorer(),
+        config=MLCacheRuntimeConfig(
+            eviction=EvictionRuntimeConfig(policy=args.eviction_policy, max_entries=args.max_entries),
+        ),
     )
 
     cached_embedding = provider.embed(args.cached_query)

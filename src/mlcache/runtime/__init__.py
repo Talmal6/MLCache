@@ -1,6 +1,7 @@
 """Runtime orchestration boundaries."""
 
 from mlcache.runtime.config import (
+    EvictionRuntimeConfig,
     MLCacheRuntimeConfig,
     QueryLevelRuntimeConfig,
     RuntimeRefitConfig,
@@ -12,6 +13,7 @@ from mlcache.runtime.local import build_local_mlcache_runtime
 from mlcache.runtime.runtime import MLCacheRuntime, SemanticCacheRuntime
 
 __all__ = [
+    "EvictionRuntimeConfig",
     "MLCacheRuntime",
     "MLCacheRuntimeConfig",
     "QueryLevelRuntimeConfig",

@@ -1,5 +1,14 @@
 """Cache gateway and external KV boundaries."""
 
+from mlcache.cache.eviction import (
+    CacheEvictionPolicy,
+    EvictionEntryMetadata,
+    EvictionPolicyName,
+    FIFOEvictionPolicy,
+    LFUEvictionPolicy,
+    LRUEvictionPolicy,
+    build_eviction_policy,
+)
 from mlcache.cache.file_store import FileKVStore
 from mlcache.cache.gateway import CacheGatewayResult, ExternalSemanticCache, SemanticCacheGateway
 from mlcache.cache.in_memory import InMemoryKVStore
@@ -12,11 +21,18 @@ from mlcache.persistence.postgres import PostgresKVStore
 from mlcache.persistence.sqlite import SQLiteKVStore
 
 __all__ = [
+    "CacheEvictionPolicy",
     "CacheGatewayResult",
+    "EvictionEntryMetadata",
+    "EvictionPolicyName",
     "ExternalSemanticCache",
+    "FIFOEvictionPolicy",
     "FileKVStore",
     "InMemoryKVStore",
     "KVStore",
+    "LFUEvictionPolicy",
+    "LRUEvictionPolicy",
+    "build_eviction_policy",
     "MySQLKVStore",
     "MySQLSemanticCacheGateway",
     "PostgresKVStore",

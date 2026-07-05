@@ -46,10 +46,19 @@ def test_ensemble_weight_fit_is_invariant_to_member_score_scale() -> None:
 
     assert np.allclose(baseline.weights, rescaled.weights)
     features = PairFeatures(hadamard=(35.0, 17.0))
-    assert float(baseline.score(features)) == float(rescaled.score(features))
+    # z-score normalization is affine-invariant for positive member rescaling,
+    # but the two arithmetic paths differ in float rounding, so compare with a
+    # tolerance rather than bit-exact equality.
+    assert np.isclose(float(baseline.score(features)), float(rescaled.score(features)))
 
 
-def test_equal_tpr_weight_solution_uses_more_of_the_fpr_budget() -> None:
+def test_equal_tpr_weight_solution_prefers_blended_anticollapse() -> None:
+    # Both single-judge solutions ([1,0] and [0,1]) reach TPR=1.0 at alpha=0.5,
+    # as does the uniform blend [0.5,0.5]. The weight search must NOT collapse
+    # onto one judge: among equal-TPR feasible solutions it prefers the more
+    # spread (higher-entropy) vector, which keeps a complementary judge in the
+    # mix to break score ties. Collapsing is exactly what produced an
+    # uncalibratable H0/H1 score atom in the online ensemble.
     ensemble = EnsembleScorer(judges=[_ColumnScorer(0), _ColumnScorer(1)])
     z0 = np.asarray(
         [
@@ -64,4 +73,4 @@ def test_equal_tpr_weight_solution_uses_more_of_the_fpr_budget() -> None:
 
     weights = ensemble._fit_np_weights(z0, z1, alpha=0.5)
 
-    assert np.allclose(weights, [0.0, 1.0])
+    assert np.allclose(weights, [0.5, 0.5])

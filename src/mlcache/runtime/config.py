@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import os
 from typing import Any
 
+from mlcache.cache.eviction import EvictionPolicyName
 from mlcache.policies.query_level import QueryLevelPolicyMode
 from mlcache.semantic_types import Threshold
 
@@ -16,6 +17,7 @@ class ShadowRuntimeConfig:
     top_k: int = 5
     max_pairs_per_request: int | None = None
     calibration_every_n: int = 5
+    calibration_fraction: float | None = None
     collect_uncertain: bool = False
 
 
@@ -24,6 +26,35 @@ class RuntimeRefitConfig:
     auto_refit: bool = True
     target_false_accept_rate: float = 0.05
     top_k: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class EvictionRuntimeConfig:
+    """Configures the cache eviction behavior.
+
+    ``policy`` selects which entry is removed when the cache is full (one of
+    ``lru``, ``lfu``, ``fifo``). ``max_entries`` is the capacity bound; when it
+    is ``None`` the cache is unbounded and no eviction ever happens (preserving
+    the historical default).
+    """
+
+    policy: str = "lru"
+    max_entries: int | None = None
+
+    def __post_init__(self) -> None:
+        # Validate eagerly so misconfiguration fails at construction time.
+        object.__setattr__(self, "policy", EvictionPolicyName(str(self.policy).strip().lower()).value)
+        if self.max_entries is not None and int(self.max_entries) <= 0:
+            raise ValueError("eviction max_entries must be a positive integer or None")
+
+    @classmethod
+    def from_env(cls) -> "EvictionRuntimeConfig":
+        policy = os.getenv("MLCACHE_EVICTION_POLICY")
+        max_entries = os.getenv("MLCACHE_MAX_ENTRIES")
+        return cls(
+            policy=policy.strip().lower() if policy else "lru",
+            max_entries=int(max_entries) if max_entries else None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,5 +123,6 @@ class MLCacheRuntimeConfig:
     refit: RuntimeRefitConfig = field(default_factory=RuntimeRefitConfig)
     query_level: QueryLevelRuntimeConfig = field(default_factory=QueryLevelRuntimeConfig)
     storage: StorageRuntimeConfig = field(default_factory=StorageRuntimeConfig)
+    eviction: EvictionRuntimeConfig = field(default_factory=EvictionRuntimeConfig)
     namespace: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)

@@ -14,7 +14,9 @@ from typing import Any, Iterable
 from mlcache.calibration import ThresholdCalibrationRequest, ThresholdScope
 from mlcache.feedback import JudgedPairExample, JudgeLabel, SemanticReuseJudge
 from mlcache.features import NormalizedHadamardFeatureBuilder, PairFeatureBuilder
-from mlcache.runtime.config import MLCacheRuntimeConfig, RuntimeRefitConfig
+from dataclasses import replace
+
+from mlcache.runtime.config import EvictionRuntimeConfig, MLCacheRuntimeConfig, RuntimeRefitConfig
 from mlcache.runtime.local import build_local_mlcache_runtime
 from mlcache.runtime.runtime import MLCacheRuntime
 from mlcache.scorers import (
@@ -139,17 +141,29 @@ class MLCache:
         judge: SemanticReuseJudge | None = None,
         config: MLCacheRuntimeConfig | None = None,
         scorer_kwargs: dict[str, object] | None = None,
+        eviction_policy: str = "lru",
+        max_entries: int | None = None,
     ) -> "MLCache":
         """Build a ready-to-use `MLCache` without manually wiring its components.
 
         This is the normal way to construct the cache: it picks a feature
         builder, resolves the scorer preset(s), wires file or in-memory
         persistence, and applies the pair-level threshold in one call.
+
+        Pass ``max_entries`` to bound the cache and ``eviction_policy`` (one of
+        ``lru``, ``lfu``, ``fifo``) to choose which entry is dropped when the
+        bound is exceeded. With ``max_entries=None`` the cache is unbounded and
+        eviction never runs.
         """
 
         scorer_obj = build_scorer(scorer, scorers=scorers, **(scorer_kwargs or {}))
         builder = feature_builder or NormalizedHadamardFeatureBuilder()
         runtime_config = config or MLCacheRuntimeConfig(refit=RuntimeRefitConfig(auto_refit=False, top_k=int(top_k)))
+        if max_entries is not None or eviction_policy != "lru":
+            runtime_config = replace(
+                runtime_config,
+                eviction=EvictionRuntimeConfig(policy=eviction_policy, max_entries=max_entries),
+            )
 
         runtime = build_local_mlcache_runtime(
             root_dir=root_dir,
@@ -263,6 +277,8 @@ def build_mlcache(
     judge: SemanticReuseJudge | None = None,
     config: MLCacheRuntimeConfig | None = None,
     scorer_kwargs: dict[str, object] | None = None,
+    eviction_policy: str = "lru",
+    max_entries: int | None = None,
 ) -> MLCache:
     """Factory-function form of `MLCache.from_preset`."""
 
@@ -277,6 +293,8 @@ def build_mlcache(
         judge=judge,
         config=config,
         scorer_kwargs=scorer_kwargs,
+        eviction_policy=eviction_policy,
+        max_entries=max_entries,
     )
 
 
